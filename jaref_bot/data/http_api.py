@@ -1,5 +1,6 @@
-import aiohttp
+from aiohttp import ClientSession, ClientError, ClientResponseError
 import asyncio
+import requests
 import pandas as pd
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -25,21 +26,30 @@ class ExchangeRestAPI(ABC):
         self.category = category
         assert self.category in ('spot', 'linear'), 'category should be "spot" or "linear"'
     
-    async def _send_request(self, session, endpoint, params=None):
-        params = params if params else {}
-        async with session.get(self.BASE_URL + endpoint, params=params) as response:
-            return await response.json()
+    async def _send_request(self, session, endpoint, params=None, n_tries=10, timeout=5):
+        params = params or {}
+        for attempt in range(1, n_tries + 1):
+            try:
+                async with session.get(
+                    self.BASE_URL + endpoint, params=params, timeout=timeout
+                    ) as response:
+                        # response.raise_for_status()
+                        return await response.json()
+            except (asyncio.TimeoutError, ClientError) as e:
+                logger.error(f"Ошибка соединения с биржей {self.EXCHANGE_NAME}. Попытка {attempt}/{n_tries}: {e}")
+                await asyncio.sleep(2)
+            # except KeyboardInterrupt:
+            #     print('Завершение работы.')
+            #     break
+            # except ClientResponseError:
+            #     print(f'Ошибка соединения {endpoint}')
                     
     @abstractmethod
-    async def _get_exchange_name(self):
+    def _create_symbol_name(self, symbol):
         pass
 
     @abstractmethod
     async def get_tickers(self, session):
-        pass
-
-    @abstractmethod
-    async def _get_candles_endpoint(self):
         pass
 
     @abstractmethod
@@ -50,11 +60,57 @@ class ExchangeRestAPI(ABC):
     async def _get_candles_workflow_params(self):
         pass
 
-    async def get_candles(self, session, symbol, interval, n_iters=1, end_date=None):
-        # assert interval in ('1m', '5m', '15m', '30m', '1h', '4h', '1d'), "possible interval values: '1m', '5m', '15m', '30m', '1h', '4h', '1d'"
+    @abstractmethod
+    def _get_instr_params(self):
+        pass
+
+    @abstractmethod
+    def _parse_instr_data(self, data):
+        pass
+
+    @abstractmethod
+    def _get_orderbook_params(self):
+        pass
+
+    @abstractmethod
+    def _parse_orderbook_data(self, data):
+        pass
+
+    async def get_orderbook(self, session, symbol, limit):
+        if self.category == 'linear':
+            endpoint = self.ORDERBOOK_LINEAR_ENDPOINT
+        elif self.category == 'spot':
+            endpoint = self.ORDERBOOK_SPOT_ENDPOINT
+
+        symbol = self._create_symbol_name(symbol)
+        params = self._get_orderbook_params(symbol, limit)
         
-        exc = self._get_exchange_name()
-        endpoint = self._get_candles_endpoint()
+        try:
+            data = await self._send_request(session, endpoint=endpoint, params=params)
+        except ClientResponseError:
+            return {}
+        
+        return self._parse_orderbook_data(data)
+
+    def get_instrument_data(self):
+        if self.category == 'linear':
+            endpoint = self.INSTR_LINEAR_ENDPOINT
+        elif self.category == 'spot':
+            endpoint = self.INSTR_SPOT_ENDPOINT
+
+        params = self._get_instr_params()
+        r = requests.request('GET', self.BASE_URL + endpoint, params=params).json()
+        return r
+        return self._parse_instr_data(r)
+
+    async def get_candles(self, session, symbol, interval, n_iters=1, end_date=None):
+        assert interval in ('1m', '5m', '15m', '30m', '1h', '4h', '1d'), "possible interval values: '1m', '5m', '15m', '30m', '1h', '4h', '1d'"
+        
+        exc = self.EXCHANGE_NAME
+        if self.category == 'spot':
+            endpoint = self.CANDLES_SPOT_ENDPOINT 
+        elif self.category == 'linear':
+            endpoint = self.CANDLES_LINEAR_ENDPOINT 
 
         params = self._get_candles_params_to_send()
         wf_prams = self._get_candles_workflow_params()
@@ -88,8 +144,6 @@ class ExchangeRestAPI(ABC):
 
         try:
             for _ in range(n_iters):
-                # logger.info(f"Fetching data for {symbol} from {self.__class__.__name__}...")
-                
                 data = await self._send_request(session, endpoint=endpoint, params=params)
                 
                 if not data:
@@ -123,9 +177,11 @@ class ExchangeRestAPI(ABC):
                     ignore_index=True)
                 
         except KeyError as e:
-            logger.warning(f'No data for {exc} {self.category}')
+            # logger.warning(f'No data for {exc} {self.category}')
+            pass
         except Exception as e:
-            logger.error(f"{exc} {self.category}. Error fetching data: {e}")
+            # logger.error(f"{exc} {self.category}. Error fetching data: {e}")
+            pass
         
         if cols_to_drop:
             try:
@@ -159,13 +215,48 @@ class ExchangeRestAPI(ABC):
 
         
 class BybitRestAPI(ExchangeRestAPI):
+    EXCHANGE_NAME = 'bybit'
     BASE_URL = "https://api.bybit.com"
+    CANDLES_SPOT_ENDPOINT = '/v5/market/kline'
+    CANDLES_LINEAR_ENDPOINT = '/v5/market/kline'
+    INSTR_SPOT_ENDPOINT = "/v5/market/instruments-info"
+    INSTR_LINEAR_ENDPOINT = "/v5/market/instruments-info"
+    ORDERBOOK_SPOT_ENDPOINT = '/v5/market/orderbook'
+    ORDERBOOK_LINEAR_ENDPOINT = '/v5/market/orderbook'
 
-    def _get_exchange_name(self):
-        return 'bybit'
+    def _create_symbol_name(self, symbol):
+        return symbol + 'USDT'
 
-    def _get_candles_endpoint(self):
-        return '/v5/market/kline'
+    def _get_instr_params(self):
+        return {'category': self.category}
+
+    def _parse_instr_data(self, data):
+        instr_data = {}
+        for ticker in data['result']['list']:
+            if ticker['symbol'].endswith('USDT'):
+                base = ticker['baseCoin']
+                quote = ticker['quoteCoin']
+                min_qty = float(ticker['lotSizeFilter']['minOrderQty'])
+                
+                if self.category == 'linear':
+                    qty_step = float(ticker['lotSizeFilter']['qtyStep'])
+                elif self.category == 'spot':
+                    qty_step = float(ticker['lotSizeFilter']['basePrecision'])
+                instr_data[base+'_'+quote] = {'min_qty': min_qty, 'qty_step': qty_step}
+        return instr_data
+
+    def _get_orderbook_params(self, symbol, limit):
+        return {'category': self.category, 'symbol': symbol, 'limit': limit}
+
+    def _parse_orderbook_data(self, data):
+        try:
+            ask = data['result']['a']
+            bid = data['result']['b']
+            res_dic = {'ask': [[float(x[0]), float(x[1])] for x in ask], 
+                        'bid': [[float(x[0]), float(x[1])] for x in bid]}
+            return res_dic
+        except KeyError:
+            return {}
 
     def _get_candles_params_to_send(self):
         return {'category': self.category, 'limit': 1000}
@@ -205,13 +296,61 @@ class BybitRestAPI(ExchangeRestAPI):
 
 
 class OKXRestAPI(ExchangeRestAPI):
+    EXCHANGE_NAME = 'okx'
     BASE_URL = 'https://www.okx.com'
+    CANDLES_SPOT_ENDPOINT = '/api/v5/market/history-candles'
+    CANDLES_LINEAR_ENDPOINT = '/api/v5/market/history-candles'
+    INSTR_SPOT_ENDPOINT = '/api/v5/public/instruments'
+    INSTR_LINEAR_ENDPOINT = '/api/v5/public/instruments'
+    ORDERBOOK_SPOT_ENDPOINT = '/api/v5/market/books'
+    ORDERBOOK_LINEAR_ENDPOINT = '/api/v5/market/books'
 
-    def _get_exchange_name(self):
-        return 'okx'
+    def _create_symbol_name(self, symbol):
+        return symbol + '-USDT'
 
-    def _get_candles_endpoint(self):
-        return '/api/v5/market/history-candles'
+    def _get_instr_params(self):
+        if self.category == 'linear':
+            return {'instType': 'SWAP'}
+        elif self.category == 'spot':
+            return {'instType': 'SPOT'}
+        
+
+    def _parse_instr_data(self, data):
+        instr_data = {}
+        for ticker in data['data']:
+            if self.category == 'linear':
+                if ticker['instFamily'].endswith('USDT'):
+                    base = ticker['ctValCcy']
+                    quote = ticker['settleCcy']
+                    contract_size = float(ticker['ctVal'])
+                    min_qty = float(ticker['minSz']) * contract_size
+                    qty_step = float(ticker['lotSz']) * contract_size
+
+                    instr_data[base+'_'+quote] = {'contract_size': contract_size, 
+                                        'min_qty': min_qty, 'qty_step': qty_step}
+            elif self.category == 'spot':
+                if ticker['instId'].endswith('USDT'):
+                    base = ticker['baseCcy']
+                    quote = ticker['quoteCcy']
+                    min_qty = float(ticker['minSz'])
+                    qty_step = float(ticker['lotSz'])
+                    instr_data[base+'_'+quote] = {'min_qty': min_qty, 'qty_step': qty_step}
+        return instr_data
+
+    def _get_orderbook_params(self, symbol, limit):
+        if self.category == 'linear':
+            symbol += '-SWAP'
+        return {'instId': symbol, 'sz': limit}
+
+    def _parse_orderbook_data(self, data):
+        try:
+            ask = data['data'][0]['asks']
+            bid = data['data'][0]['bids']
+            res_dic = {'ask': [[float(x[0]), float(x[1])] for x in ask], 
+                        'bid': [[float(x[0]), float(x[1])] for x in bid]}
+            return res_dic
+        except KeyError:
+            return {}
 
     def _get_candles_params_to_send(self):
         return {}
@@ -245,16 +384,68 @@ class OKXRestAPI(ExchangeRestAPI):
 
 
 class GateIORestAPI(ExchangeRestAPI):
+    EXCHANGE_NAME = 'gate'
     BASE_URL = 'https://api.gateio.ws'
+    CANDLES_SPOT_ENDPOINT = '/api/v4/spot/candlesticks'
+    CANDLES_LINEAR_ENDPOINT = '/api/v4/futures/usdt/candlesticks'
+    INSTR_SPOT_ENDPOINT = '/api/v4/spot/currency_pairs'
+    INSTR_LINEAR_ENDPOINT = '/api/v4/futures/usdt/contracts'
+    ORDERBOOK_SPOT_ENDPOINT = '/api/v4/spot/order_book'
+    ORDERBOOK_LINEAR_ENDPOINT = '/api/v4/futures/usdt/order_book'
 
-    def _get_exchange_name(self):
-        return 'gate'
+    def _create_symbol_name(self, symbol):
+        return symbol + '_USDT'
 
-    def _get_candles_endpoint(self):
-        if self.category == 'spot':
-            return '/api/v4/spot/candlesticks'
-        elif self.category == 'linear':
-            return '/api/v4/futures/usdt/candlesticks'
+    def _get_instr_params(self):
+        return {'Accept': 'application/json', 'Content-Type': 'application/json'}
+
+    def _parse_instr_data(self, data):
+        instr_data = {}
+        for ticker in data:
+            if self.category == 'spot':
+                if ticker['id'].endswith('USDT'):
+                    base = ticker['base']
+                    quote = ticker['quote']
+                    min_qty = float(ticker['min_base_amount'])
+                    
+                    prec = int(ticker['amount_precision'])
+                    qty_step = round(1 / (10 ** prec), prec)
+                    instr_data[base+'_'+quote] = {'min_qty': min_qty, 'qty_step': qty_step}
+            elif self.category == 'linear':
+                if ticker['name'].endswith('USDT'):
+                    base = ticker['name'].split('_')[0]
+                    quote = ticker['name'].split('_')[-1]
+                    min_qty = float(ticker['order_size_min'])
+                    qty_step = float(ticker['order_size_min'])
+
+                    if ticker['in_delisting']:
+                        raise Exception(f'Coin {ticker['name']} in delisting!!!')
+        
+                    instr_data[base+'_'+quote] = {'min_qty': min_qty, 'qty_step': qty_step}
+        return instr_data
+
+    def _get_orderbook_params(self, symbol, limit):
+        if self.category == 'linear':
+            return {'contract': symbol, 'limit': limit, 
+                'Accept': 'application/json', 'Content-Type': 'application/json'}
+        elif self.category == 'spot':
+            return {'currency_pair': symbol, 'limit': limit,
+                'Accept': 'application/json', 'Content-Type': 'application/json'}
+    
+    def _parse_orderbook_data(self, data):
+        try:
+            res_dic = {'ask': [[float(x['p']), float(x['s'])] for x in data['asks']], 
+                    'bid': [[float(x['p']), float(x['s'])] for x in data['bids']]}
+
+            return res_dic
+        except TypeError:
+            res_dic = {'ask': [[float(x[0]), float(x[1])] for x in data['asks']], 
+                    'bid': [[float(x[0]), float(x[1])] for x in data['bids']]}
+            
+            return res_dic
+        except KeyError:
+            return {}
+
 
     def _get_candles_params_to_send(self):
         return {'Accept': 'application/json', 'Content-Type': 'application/json'}
@@ -315,7 +506,7 @@ class ExchangeManager:
         self.exchanges[name] = exchange
 
     async def get_prices(self):
-        async with aiohttp.ClientSession() as session:
+        async with ClientSession() as session:
             tasks = {
                 name: asyncio.create_task(exchange.get_tickers(session))
                 for name, exchange in self.exchanges.items()
@@ -329,9 +520,30 @@ class ExchangeManager:
 
 
     async def get_candles(self, symbol, interval, n_iters=1):
-        async with aiohttp.ClientSession() as session:
+        async with ClientSession() as session:
             tasks = {
                 name: exchange.get_candles(session, symbol, interval, n_iters)
                 for name, exchange in self.exchanges.items()
             }
+
             return await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+    def get_instrument_data(self):
+        results = {}
+        for name, task in self.exchanges.items():
+            results[name] = task.get_instrument_data()
+        
+        return results
+
+    async def get_orderbook(self, symbol, limit):
+        async with ClientSession() as session:
+            tasks = {
+                name: asyncio.create_task(exchange.get_orderbook(session, symbol, limit))
+                for name, exchange in self.exchanges.items()
+            }
+            
+            results = {}
+            for name, task in tasks.items():
+                results[name] = await task
+            
+            return results
