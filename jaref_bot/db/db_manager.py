@@ -133,7 +133,9 @@ class DBManager:
                 rows = cur.fetchall()
                 columns = [desc[0] for desc in cur.description]
                 # Преобразование в DataFrame
-                df = pd.DataFrame(rows, columns=columns).set_index('token')
+                df = pd.DataFrame(rows, columns=columns)
+                if 'id' in df.columns:
+                    df = df.set_index('id')
                 return df
         except Exception as e:
             self.conn.rollback()
