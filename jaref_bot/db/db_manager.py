@@ -1,6 +1,6 @@
 import psycopg2
 from psycopg2.extras import DictCursor
-from psycopg2.errors import UniqueViolation
+from psycopg2.errors import UniqueViolation, UndefinedColumn
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 
@@ -9,13 +9,13 @@ class DBManager:
         self.conn = psycopg2.connect(**db_params)
         self.conn.autocommit = True
 
-    def add_order(self, token, exchange, market_type, order_type, order_id, order_side,
-                  price, avg_price, usdt_amount, qty, fee, created_at=None):
-        """Добавляет новый ордер в таблицу current_orders"""
+    def place_order(self, token, exchange, market_type, order_type, order_side,
+                  qty, fee, ct_val, created_at=None):
+        """Добавляет новый ордер в таблицу pending_orders"""
         query = """
-        INSERT INTO current_orders (token, exchange, market_type, order_type, order_id,
-        order_side, price, avg_price, usdt_amount, qty, fee, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+        INSERT INTO pending_orders (token, exchange, market_type, order_type,
+        order_side, qty, fee, ct_val, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
         """
 
         # Если created_at не передан, используем текущее время
@@ -25,18 +25,111 @@ class DBManager:
 
         try:
             with self.conn.cursor() as cursor:
-                cursor.execute(query, (token, exchange, market_type, order_type, order_id,
-                                       order_side, price, avg_price, usdt_amount, qty,
-                                       fee, created_at))
+                cursor.execute(query, (token, exchange, market_type, order_type,
+                                       order_side, qty, fee, ct_val, created_at))
         except psycopg2.IntegrityError as e:
             self.conn.rollback()
-            raise UniqueViolation(f"Order with token '{token}' on {exchange} already exists.")
+            raise UniqueViolation(f"Order '{token}' on {exchange}.{market_type} already exists.")
 
-    def order_exists(self, token):
+    def fill_order(self, token: str, exchange: str, market_type: str,
+               order_id: str, qty: float, price: float,
+               usdt_amount: float = None, fee: float = None) -> None:
+        """
+        Переносит запись из таблицы pending_orders в current_orders при подтверждении ордера.
+
+        Args:
+            token: Идентификатор токена
+            exchange: Название биржи
+            market_type: Тип рынка
+            order_id: ID ордера с биржи
+            qty: Количество купленного/проданного актива
+            price: Цена исполнения
+            usdt_amount: Сумма в USDT (опционально)
+            fee: Комиссия (опционально)
+
+        Raises:
+            Exception: Если запись не найдена в pending_orders
+        """
+        try:
+            # Создаем новый курсор для транзакции
+            with self.conn.cursor() as cur:
+                # Начинаем транзакцию
+                self.conn.autocommit = False
+
+                # Проверяем существование записи и получаем её данные
+                cur.execute("""
+                    SELECT order_type, order_side, fee
+                    FROM pending_orders
+                    WHERE token = %s AND exchange = %s AND market_type = %s
+                """, (token, exchange, market_type))
+
+                result = cur.fetchone()
+                if not result:
+                    raise ValueError(f"Order ({token}, {exchange}, {market_type}) not found in pending_orders")
+
+                order_type, order_side, pending_fee = result
+
+                # Вставляем запись в current_orders
+                cur.execute("""
+                    INSERT INTO current_orders
+                    (token, exchange, market_type, order_type, order_id,
+                    order_side, price, usdt_amount, qty, fee)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    token, exchange, market_type, order_type, order_id,
+                    order_side, price, usdt_amount, qty,
+                    fee if fee is not None else pending_fee
+                ))
+
+                # Удаляем запись из pending_orders
+                cur.execute("""
+                    DELETE FROM pending_orders
+                    WHERE token = %s AND exchange = %s AND market_type = %s
+                """, (token, exchange, market_type))
+
+                # Фиксируем транзакцию
+                self.conn.commit()
+
+        except Exception as e:
+            # В случае ошибки откатываем транзакцию
+            self.conn.rollback()
+            raise e
+
+        finally:
+            # Восстанавливаем autocommit
+            self.conn.autocommit = True
+
+    def close_order(self, token, exchange, market_type, close_price, close_usdt_amount, close_fee, closed_at=None):
+        if closed_at is None:
+            Moscow_TZ = timezone(timedelta(hours=3))
+            closed_at = datetime.now(Moscow_TZ)
+
+        query = """
+        WITH moved_order AS (
+            DELETE FROM current_orders
+            WHERE token = %s AND exchange = %s AND market_type = %s
+            RETURNING token, exchange, market_type, order_type, order_side, price, usdt_amount, qty, fee, created_at
+        )
+        INSERT INTO trading_history (token, exchange, market_type, order_type, order_side, open_price, close_price,
+                                     open_usdt_amount, close_usdt_amount, qty, open_fee, close_fee, created_at, closed_at)
+        SELECT token, exchange, market_type, order_type, order_side, price, %s,
+               usdt_amount, %s, qty, fee, %s, created_at, %s
+        FROM moved_order;
+        """
+
+        with self.conn.cursor() as cursor:
+            cursor.execute(query, (
+                token, exchange, market_type,
+                close_price, close_usdt_amount, close_fee, closed_at))
+
+    def order_exists(self, table_name, token, exchange, market_type):
         """Проверяет, существует ли в таблице current_orders запись с заданным token"""
-        query = "SELECT 1 FROM current_orders WHERE token = %s"
+        query = f"""
+        SELECT 1 FROM {table_name}
+        WHERE token = %s AND exchange = %s AND market_type = %s
+        """
         with self.conn.cursor() as cur:
-            cur.execute(query, (token,))
+            cur.execute(query, (token, exchange, market_type))
             return cur.fetchone() is not None
 
     def get_order(self, token):
@@ -51,49 +144,11 @@ class DBManager:
 
     def delete_order(self, token):
         """Удаляет запись из таблицы current_orders по token"""
-        query = "DELETE FROM current_orders WHERE token = %s"
+        query = """DELETE FROM current_orders
+        WHERE token = %s AND exchange = %s AND market_type = %s"""
         with self.conn.cursor() as cur:
             cur.execute(query, (token,))
-            # self.conn.commit()
 
-    def close_order(self, token, exchange, market_type, close_price, close_avg_price,
-                    close_usdt_amount, qty, close_fee, closed_at=None):
-        """Закрывает ордер и переносит его в таблицу trading_history"""
-
-        if closed_at is None:
-            Moscow_TZ = timezone(timedelta(hours=3))
-            closed_at = datetime.now(Moscow_TZ)
-
-        with self.conn.cursor(cursor_factory=DictCursor) as cur:
-            # Проверка существования записи
-            cur.execute("""
-                SELECT order_type, order_side, price, avg_price, usdt_amount, qty, fee, created_at
-                FROM current_orders
-                WHERE token = %s AND exchange = %s AND market_type = %s
-            """, (token, exchange, market_type))
-
-            order = cur.fetchone()
-            if not order:
-                raise ValueError(f"No order found with token '{token}', exchange '{exchange}', market_type '{market_type}'.")
-
-            # Перенос данных в таблицу trading_history
-            cur.execute("""
-                INSERT INTO trading_history (token, exchange, market_type, order_type, order_side,
-                        open_price, close_price, open_avg_price, close_avg_price,
-                        open_usdt_amount, close_usdt_amount, qty, open_fee, close_fee,
-                        created_at, closed_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                token, exchange, market_type, order['order_type'], order['order_side'],
-                order['price'], close_price, order['avg_price'], close_avg_price, order['usdt_amount'],
-                close_usdt_amount, qty, order['fee'], close_fee, order['created_at'], closed_at
-            ))
-
-            # Удаление записи из current_orders
-            cur.execute("""
-                DELETE FROM current_orders
-                WHERE token = %s AND exchange = %s AND market_type = %s
-            """, (token, exchange, market_type))
 
     def update_data(self, data, tokens_to_insert):
         with self.conn.cursor() as cur:
@@ -120,6 +175,22 @@ class DBManager:
                             metrics.get('bid_price'),
                             metrics.get('ask_price'),
                         ))
+
+    def clear_old_data(self, table_name, expiration_time):
+        """
+        Удаляет из таблицы 'table_name' все данные, которые старше 'expiration_time'
+        :param table_name: название таблицы.
+        :param expiration_time: время в секундах
+        """
+
+        try:
+            query = f"DELETE FROM {table_name} WHERE timestamp < NOW() - INTERVAL '{expiration_time} seconds';"
+            with self.conn.cursor() as cur:
+                    cur.execute(query)
+        except UndefinedColumn:
+            query = f"DELETE FROM {table_name} WHERE created_at < NOW() - INTERVAL '{expiration_time} seconds';"
+            with self.conn.cursor() as cur:
+                    cur.execute(query)
 
     def get_table(self, table_name):
         """
@@ -155,8 +226,11 @@ class DBManager:
             self.conn.rollback()
             raise ValueError(f"Failed to fetch data from table: {e}")
 
-
     def get_auto_copy_trigger_state(self):
+        """
+        Функция проверяет, в какое значение установлено автокопирование данных
+        из таблицы current_data в таблицу market_data ('ENABLE' or 'DISABLE')
+        """
         query = """
             SELECT tgenabled
             FROM pg_trigger
