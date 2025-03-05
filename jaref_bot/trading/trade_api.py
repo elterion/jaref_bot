@@ -47,6 +47,11 @@ class BaseTrade:
         assert order_type in ('market', 'limit'), 'order_type should be "market" or "limit"'
         return self._get_position(market_type, symbol, order_type, **kwargs)
 
+    def get_order(self, symbol, market_type, order_id, **kwargs):
+        assert market_type in ('linear', 'spot'), 'market_type should be "linear" or "spot"'
+        return self._get_order(symbol=symbol, market_type=market_type, order_id=order_id, **kwargs)
+
+
 class BybitTrade(BaseTrade):
     EXCHANGE = 'bybit'
 
@@ -182,6 +187,7 @@ class BybitTrade(BaseTrade):
         usdt_amount = Decimal(data['cumExecValue'])
         side = data['side'].lower()
         size = Decimal(data['cumExecQty'])
+        # print(f'Order handler: {size=}, {price=}, {usdt_amount=}')
 
         fee_perc = Decimal(self.fees[market_type + '_' + order_type])
         fee = (usdt_amount * fee_perc).normalize()
@@ -206,6 +212,7 @@ class BybitTrade(BaseTrade):
         url = f'{url}?{query}'
         response = requests.get(url=url, headers=headers).json()
 
+        # return response
         try:
             return self._order_handler(response, market_type)
         except InvalidOperation:
@@ -345,7 +352,7 @@ class OkxTrade(OkxClient, BaseTrade):
             logger.error(f'[ORDER ERROR] Okx {market_type=} {sym=}')
             raise PlaceOrderError(f'При постановке ордера на бирже Okx возникла ошибка: {response['data'][0]['sMsg']}')
 
-        return response
+        return order_id
 
     def _set_leverage(self, market_type, symbol, lever, margin_mode='isolated'):
         assert margin_mode in ('isolated', 'cross'), 'margin_mode should be "isolated" or "cross"'
@@ -377,7 +384,7 @@ class OkxTrade(OkxClient, BaseTrade):
         price = Decimal(data['avgPx'])
         usdt_amount = Decimal(data['notionalUsd']).normalize()
         side = 'buy' if float(data['pos']) > 0 else 'sell'
-        qty = Decimal(data['pos']) * ct_val
+        qty = abs(Decimal(data['pos']) * ct_val)
 
         fee = abs(Decimal(data['fee']))
 
@@ -394,6 +401,36 @@ class OkxTrade(OkxClient, BaseTrade):
                     request_path=path)
         try:
             return self._position_handler(response, market_type, order_type, ct_val)
+        except InvalidOperation:
+            return None
+
+    def _order_handler(self, resp, market_type, order_type, ct_val):
+        data = resp['data'][0]
+
+        line = data['instId']
+        syms = line.split('-')
+        base, quote = syms[0], syms[1]
+        token = base + '_' + quote
+
+        price = Decimal(data['avgPx'])
+
+        side = data['side']
+        qty = Decimal(data['sz']) * ct_val
+        fee = abs(Decimal(data['fee']))
+        usdt_amount = (qty * price).normalize()
+
+        return {'exchange': 'okx', 'market_type': market_type, 'order_type': order_type,
+                'token': token, 'price': price,
+                'usdt_amount': usdt_amount, 'qty': qty, 'order_side': side, 'fee': fee}
+
+    def _get_order(self, symbol, market_type, order_id, order_type, ct_val, **kwargs):
+        sym = self._create_symbol_name(market_type, symbol)
+        path = f'/api/v5/trade/order?ordId={order_id}&instId={sym}'
+        response = self._request_without_params(method='GET',
+                    request_path=path)
+        # return response
+        try:
+            return self._order_handler(response, market_type, order_type, ct_val)
         except InvalidOperation:
             return None
 
@@ -509,3 +546,42 @@ class GateTrade(BaseTrade):
             logger.error(f'[LEVERAGE ERROR] Gate {symbol}')
             raise SetLeverageError(f'При изменении плеча на бирже Gate возникла ошибка: {response.get('label')}, {response.get('message')}')
         return response
+
+    def _position_handler(self, resp, market_type, order_type, ct_val):
+        token = resp['contract']
+
+        leverage = Decimal(resp['leverage'])
+        price = Decimal(resp['entry_price'])
+        usdt_amount = Decimal(resp['value'])
+        side = 'buy' if float(resp['size']) > 0 else 'sell'
+        qty = abs(Decimal(resp['size']) * ct_val)
+
+        fee = abs(Decimal(resp['pnl_fee']))
+
+        return {'exchange': 'gate', 'market_type': market_type, 'order_type': order_type,
+                'token': token, 'leverage': leverage, 'price': price,
+                'usdt_amount': usdt_amount, 'qty': qty, 'order_side': side, 'fee': fee}
+
+    def _get_position(self, market_type, symbol, order_type, ct_val):
+        if self.demo:
+            if market_type == 'linear':
+                host = "https://fx-api-testnet.gateio.ws"
+        else:
+            if market_type == 'linear':
+                host = "https://api.gateio.ws"
+
+        symbol = self._create_symbol_name(symbol)
+        prefix = "/api/v4"
+        headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+        url = f'/futures/usdt/positions/{symbol}'
+        query_param = ""
+
+        sign_headers = self.gen_sign('GET', prefix + url, query_param)
+        headers.update(sign_headers)
+        response = requests.request('GET', host + prefix + url + "?" + query_param,
+                                    headers=headers).json()
+
+        try:
+            return self._position_handler(response, market_type, order_type, ct_val)
+        except InvalidOperation:
+            return None

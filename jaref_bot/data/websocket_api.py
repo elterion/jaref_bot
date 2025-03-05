@@ -7,25 +7,52 @@ from abc import ABC, abstractmethod
 import asyncio
 import json
 import hmac
+import hashlib
 import base64
 import time
 import websockets
-from websockets.exceptions import ConnectionClosedError
+import socket
+from websockets.exceptions import ConnectionClosedError, ConnectionClosed
 from typing import Dict, List, Callable, Any
 import logging
+import pickle
+from decimal import Decimal
 
 from config import BYBIT_DEMO_API_KEY, BYBIT_DEMO_SECRET_KEY, BYBIT_API_KEY, BYBIT_SECRET_KEY
 from config import OKX_DEMO_API_KEY, OKX_DEMO_SECRET_KEY, OKX_API_KEY, OKX_SECRET_KEY, OKX_DEMO_PASSPHRASE, OKX_PASSPHRASE
+from config import GATE_DEMO_API_KEY, GATE_DEMO_SECRET_KEY
 from jaref_bot.db.db_manager import DBManager
 from config import host, user, password, db_name
 
 from psycopg2.errors import UniqueViolation
+from jaref_bot.core.exceptions.database import OrderNotFoundError
+
+def get_order_status(exchange, market_type, token):
+    order_in_pending = db_manager.order_exists(table_name='pending_orders', exchange=exchange, market_type=market_type, token=token)
+    order_in_current = db_manager.order_exists(table_name='current_orders', exchange=exchange, market_type=market_type, token=token)
+
+    if not (order_in_pending or order_in_current):
+        status = None
+    elif order_in_pending and order_in_current:
+        status = 'adding'
+    elif order_in_pending and not order_in_current:
+        status = 'placed'
+    elif not order_in_pending and order_in_current:
+        status = 'live'
+    return status
 
 db_params = {'host': host, 'user': user, 'password': password, 'database': db_name}
 db_manager = DBManager(db_params)
 
 logging.basicConfig(format="%(message)s", level=logging.INFO)
 logger = logging.getLogger()
+
+market_fees = {'bybit_spot': 0.0018, 'bybit_linear': 0.001,
+               'okx_spot': 0.001, 'okx_linear': 0.0005,
+               'gate_spot': 0.002, 'gate_linear': 0.0005}
+
+with open("./data/coin_information.pkl", "rb") as f:
+    coin_information = pickle.load(f)
 
 class BaseWebSocketClient(ABC):
     def __init__(self, urls: Dict[str, str], demo: bool = False):
@@ -45,27 +72,43 @@ class BaseWebSocketClient(ABC):
     async def authenticate(self, stream_type: str):
         pass
 
-    async def connect(self, stream_type: str):
+    async def connect(self, stream_type: str, auth_required=False):
         url = self.urls[stream_type]
+        reconnect_delay = 1  # Начальная задержка
 
-        async for websocket in websockets.connect(url, ping_interval=10):
+
+        while True:  # Бесконечный цикл переподключения
             try:
-                self.connections[stream_type] = websocket
+                logger.debug(f'Connecting to {self.exchange} ({stream_type}): {url}')
+                async with websockets.connect(url, ping_interval=15, ping_timeout=40) as websocket:
+                    self.connections[stream_type] = websocket
+                    logger.info(f'Connected to {self.exchange}')
+                    reconnect_delay = 1  # Сброс задержки после успешного подключения
 
-                logger.debug(f'Connecting to {self.exchange} ({stream_type})')
-                if url.endswith('private'):
-                    await self.authenticate(stream_type)
-                await self.resubscribe(stream_type)
-                await self.listen(websocket, stream_type)
-            except ConnectionClosedError as err:
+                    if auth_required:
+                        logger.debug(f'Sending auth request')
+                        await self.authenticate(stream_type)
+
+                    await self.resubscribe(stream_type)
+                    logger.debug(f'Listening...')
+                    await self.listen(websocket, stream_type)
+            except (ConnectionClosedError, ConnectionClosed) as err:
                 logger.error(f'{self.exchange} connection closed! {err}')
                 self.is_connected = False
-                continue
+            except socket.gaierror as err:
+                print(f"DNS resolution failed for {url}: {err}")
+                self.is_connected = False
+                await asyncio.sleep(reconnect_delay)
+            except Exception as err:
+                print(f"Unexpected error in {stream_type}: {err}")
 
-            await asyncio.sleep(2)
-            await self.connect(stream_type)
+            # Экспоненциальный backoff с верхним ограничением в 60 сек
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 60)  # Удваиваем до 60 сек
+
 
     async def resubscribe(self, stream_type: str):
+        logger.debug(f'{self.subscriptions=}')
         for stream_type, data in self.subscriptions.items():
             logger.debug(f'{stream_type=}, {data=}')
             channel = data['channel']
@@ -74,13 +117,14 @@ class BaseWebSocketClient(ABC):
 
     async def _subscribe(self, stream_type: str, channel: str, sub_msg):
         async with self.lock:
-            while not self.is_connected:
-                await asyncio.sleep(0.1)
+            await asyncio.sleep(2)
 
             if stream_type not in self.subscriptions:
                 self.subscriptions[stream_type] = dict()
+                logger.debug(f'Adding new subscription: {stream_type}')
             if channel not in self.subscriptions[stream_type]:
                 self.subscriptions[stream_type].update({'channel': channel, 'sub_msg': sub_msg})
+                logger.debug(f'All subscriptions: {self.subscriptions}')
                 logger.debug(f'{sub_msg=}')
 
                 await self.connections[stream_type].send(json.dumps(sub_msg))
@@ -90,21 +134,21 @@ class BaseWebSocketClient(ABC):
         async for msg in ws:
             try:
                 data = json.loads(msg)
-                await self.response_formatting(stream_type, data)
+                await self.default_handler(stream_type, data)
             except json.JSONDecodeError:
                 logger.error(f"Failed to parse message: {msg}")
 
-    @abstractmethod
-    async def response_formatting(self, stream_type, data):
-        pass
-
-    @abstractmethod
     async def default_handler(self, stream_type, msg):
-        pass
+        print(f'default handler. {stream_type=}, {msg=}')
 
 
 class BybitWebSocketClient(BaseWebSocketClient):
-    def __init__(self, urls, demo = False):
+    def __init__(self, demo = False):
+        if demo:
+            urls = {"private": "wss://stream-demo.bybit.com/v5/private"}
+        else:
+            urls = {"private": "wss://stream.bybit.com/v5/private"}
+
         super().__init__(urls, demo)
 
         self.exchange = 'bybit'
@@ -123,20 +167,12 @@ class BybitWebSocketClient(BaseWebSocketClient):
         await self.connections[stream_type].send(json.dumps(auth_msg))
         logger.debug(f"Sent authentication request to Bybit ({stream_type})")
 
-    async def response_formatting(self, stream_type, data):
-        if 'success' in data:
-            handler = self.default_handler
-        else:
-            handler = self.handlers.get(stream_type, self.default_handler)
-        await handler(stream_type, data)
-
     async def default_handler(self, stream_type, msg):
         event = msg.get('op')
         status = msg.get('success')
 
         if event == 'auth' and status:
-            self.is_connected = True
-            logger.info(f'Connected to {self.exchange}')
+            pass
         elif event == 'subscribe' and status:
             logger.info(f'Subscribed to {self.exchange}.{stream_type}')
         elif msg.get('data'):
@@ -148,42 +184,39 @@ class BybitWebSocketClient(BaseWebSocketClient):
         data = msg['data'][0]
 
         order_id = data['orderId']
-        symbol = data['symbol']
+        symbol = data['symbol'][:-4] + '_USDT'
 
         market_type = data['category'].lower()
-        order_status = data['orderStatus']
         side = data['side'].lower()
-        price = data['price']
-        avg_price = data['avgPrice']
-        qty = data['qty']
-        usdt_value = data['cumExecValue']
-        usdt_fee = data['cumExecFee']
-        order_type = data['orderType'].lower()
+        qty = data['cumExecQty']
+        price = float(data['avgPrice'])
+        usdt_value = float(data['cumExecValue'])
+        usdt_fee = abs(float(data['cumExecFee']))
 
-        trig_price = data['triggerPrice']
-        trig_dir = data['triggerDirection']
-        tp = data['takeProfit']
-        sl = data['stopLoss']
+        status = get_order_status(exchange='bybit', market_type=market_type, token=symbol)
 
-        try:
-            db_manager.add_order(token=symbol,
+        if status in ('placed', 'adding'):
+            db_manager.fill_order(token=symbol,
                                 exchange='bybit',
                                 market_type=market_type,
-                                order_type=order_type,
                                 order_id=order_id,
-                                order_side=side,
-                                price=price,
-                                avg_price=avg_price,
-                                usdt_amount=usdt_value,
                                 qty=qty,
+                                price=price,
+                                usdt_amount=usdt_value,
                                 fee=usdt_fee,
                                 )
-            print(f"Open order. {side} {qty} {symbol} for {usdt_value} with fee {usdt_fee}")
-        except UniqueViolation:
-            db_manager.close_order(token=symbol, exchange='bybit', market_type=market_type,
-                close_price=price, close_avg_price=avg_price, close_usdt_amount=usdt_value,
-                qty=qty, close_fee=usdt_fee)
-            print(f"Close order. {side} {qty} {symbol} for {usdt_value} with fee {usdt_fee}")
+            print(f"[OPEN ORDER] Bybit. {side} {qty} {symbol} for {usdt_value:.2f}")
+        elif status == 'live':
+            db_manager.close_order(token=symbol,
+                                exchange='bybit',
+                                market_type=market_type,
+                                close_price=price,
+                                close_usdt_amount=usdt_value,
+                                close_fee=usdt_fee,
+                                closed_at=None)
+            print(f"[CLOSE ORDER] Bybit. {side} {qty} {symbol} for {usdt_value:.2f}")
+        else:
+            raise Exception('Неизвестное состояние ордера на бирже Bybit')
 
     async def subscribe_position_stream(self):
         sub_msg = {"op": "subscribe", "args": ['position']}
@@ -194,7 +227,11 @@ class BybitWebSocketClient(BaseWebSocketClient):
         await self._subscribe(stream_type='private', channel='order', sub_msg=sub_msg)
 
 class OkxWebSocketClient(BaseWebSocketClient):
-    def __init__(self, urls, demo = False):
+    def __init__(self, demo = False):
+        if demo:
+            urls = {"private": "wss://wspap.okx.com:8443/ws/v5/private"}
+        else:
+            urls = {"private": "wss://ws.okx.com:8443/ws/v5/private"}
         super().__init__(urls, demo)
 
         self.exchange = 'okx'
@@ -221,30 +258,71 @@ class OkxWebSocketClient(BaseWebSocketClient):
         await self.connections[stream_type].send(json.dumps(auth_msg))
         logger.debug(f"Sent authentication request to Okx ({stream_type})")
 
-    async def response_formatting(self, stream_type, data):
-        if 'success' in data:
-            handler = self.default_handler
-        else:
-            handler = self.handlers.get(stream_type, self.default_handler)
-        await handler(stream_type, data)
-
     async def default_handler(self, stream_type, msg):
         event = msg.get('event')
         status = msg.get('code')
+        channel = msg.get('arg', {}).get('channel')
 
         if event == 'login' and status == '0':
             self.is_connected = True
-            logger.info(f'Connected to {self.exchange}')
+        elif event == 'channel-conn-count':
+            pass
         elif event == 'subscribe' and msg.get('connId'):
             logger.info(f'Subscribed to {self.exchange}.{stream_type}')
+        elif channel == 'orders' and msg['data'][0]['state'] in ('filled', 'partially_filled'):
+            await self.handle_order_stream(stream_type, msg)
+        elif channel == 'orders' and msg['data'][0]['state'] == 'live':
+            pass
         else:
             print(f'okx default handler: {msg}')
 
-    # async def subscribe_mark_price_stream(self):
-    #     sub_msg = {"op": "subscribe", "args": [
-    #         {"channel": "mark-price", "instId": "BTC-USDT"},
-    #     ]}
-    #     await self._subscribe(stream_type='public', channel='mark-price', sub_msg=sub_msg)
+    async def handle_order_stream(self, stream_type, msg):
+        data = msg['data'][0]
+
+        order_id = data['ordId']
+        symbol = data['instId'].split('-')[0] + '_USDT'
+        qty = float(data['sz'])
+
+        market_type = data['instType'].lower()
+        if market_type == 'swap':
+            market_type = 'linear'
+            ct_val = float(coin_information['okx_linear'][symbol]['ct_val'])
+            qty *= ct_val
+
+        side = data['side'].lower()
+        usdt_fee = abs(float(data['fillFee'] or data['fee'] or 0))
+
+
+        price = float(data['avgPx'] or data['px'] or 0)
+        usdt_value = float(data['fillNotionalUsd'] or data['notionalUsd'] or 0)
+
+        if usdt_fee < 0.00001:
+            fee = float(market_fees[f'gate_{market_type}']) * usdt_value
+
+        status = get_order_status(exchange='okx', market_type=market_type, token=symbol)
+
+        if status in ('placed', 'adding'):
+            db_manager.fill_order(token=symbol,
+                                exchange='okx',
+                                market_type=market_type,
+                                order_id=order_id,
+                                qty=qty,
+                                price=price,
+                                usdt_amount=usdt_value,
+                                fee=usdt_fee,
+                                )
+            print(f"[OPEN ORDER] Okx. {side} {qty} {symbol} for {usdt_value:.2f}")
+        elif status == 'live':
+            db_manager.close_order(token=symbol,
+                                exchange='okx',
+                                market_type=market_type,
+                                close_price=price,
+                                close_usdt_amount=usdt_value,
+                                close_fee=usdt_fee,
+                                closed_at=None)
+            print(f"[CLOSE ORDER] Okx. {side} {qty} {symbol} for {usdt_value:.2f}")
+        else:
+            raise Exception('Неизвестное состояние ордера на бирже Okx')
 
     async def subscribe_order_stream(self):
         sub_msg = {"op": "subscribe", "args": [
@@ -253,36 +331,127 @@ class OkxWebSocketClient(BaseWebSocketClient):
             ]}
         await self._subscribe(stream_type='private', channel='order', sub_msg=sub_msg)
 
+class GateWebSocketClient(BaseWebSocketClient):
+    def __init__(self, demo = False):
+        if demo:
+            urls = {"gate_demo_futures": "wss://fx-ws-testnet.gateio.ws/v4/ws/usdt"}
+        else:
+            urls = {"gate_futures": "wss://fx-ws.gateio.ws/v4/ws/usdt"}
+        super().__init__(urls, demo)
 
+        self.exchange = 'gate'
+        self.api_key = GATE_DEMO_API_KEY if self.demo else None
+        self.api_secret = GATE_DEMO_SECRET_KEY if self.demo else None
+        self.uid = 20614239
+        logger.debug(f'{self.demo=}, {self.urls=}')
 
+    async def authenticate(self, stream_type: str):
+        pass
+
+    async def default_handler(self, stream_type, msg):
+        event = msg.get('event')
+        channel = msg.get('channel')
+        if event == 'subscribe':
+            status = msg.get('result', {}).get('status')
+            if status == 'success':
+                self.is_connected = True
+                logger.info(f'Subscribed to gate.{channel}')
+        elif event == 'update' and channel == 'futures.orders':
+            await self.handle_order_stream(stream_type, msg)
+
+    async def handle_order_stream(self, stream_type, msg):
+        data = msg['result'][0]
+        order_id = data['id']
+        symbol = data['contract']
+        ct_val = float(coin_information['gate_linear'][symbol]['ct_val'])
+
+        market_type = 'linear' if msg['channel'] == 'futures.orders' else None
+        price = data['fill_price']
+        qty = abs(float(data['size'])) * ct_val
+        usdt_value = float(price) * qty
+
+        fee = market_fees[f'gate_{market_type}']
+        usdt_fee = usdt_value * fee
+
+        status = get_order_status(exchange='gate', market_type=market_type, token=symbol)
+
+        if status in ('placed', 'adding'):
+            db_manager.fill_order(token=symbol,
+                                exchange='gate',
+                                market_type=market_type,
+                                order_id=order_id,
+                                qty=qty,
+                                price=price,
+                                usdt_amount=usdt_value,
+                                fee=usdt_fee,
+                                )
+            print(f"[OPEN ORDER] Gate. {qty} {symbol} for {usdt_value:.2f}")
+        elif status == 'live':
+            db_manager.close_order(token=symbol,
+                                exchange='gate',
+                                market_type=market_type,
+                                close_price=price,
+                                close_usdt_amount=usdt_value,
+                                close_fee=usdt_fee,
+                                closed_at=None)
+            print(f"[CLOSE ORDER] Gate. {qty} {symbol} for {usdt_value:.2f}")
+        else:
+            raise Exception('Неизвестное состояние ордера на бирже Gate')
+
+    def prepare_signature(self, channel, event, ts):
+        message = f'channel={channel}&event={event}&time={ts}'
+        return hmac.new(self.api_secret.encode("utf8"), message.encode("utf8"),
+                hashlib.sha512).hexdigest()
+
+    def prepare_auth_subscription_message(self, channel):
+        ts = int(time.time())
+        sub_msg = {
+            "time": ts,
+            "channel": channel,
+            "event": "subscribe",
+            "payload": [str(self.uid), "!all"],
+            "auth": {
+                "method": "api_key",
+                "KEY": self.api_key,
+                "SIGN": self.prepare_signature(channel, event="subscribe", ts=ts)
+                }
+        }
+        return sub_msg
+
+    async def subscribe_futures_positions_stream(self):
+        channel = "futures.positions"
+        sub_msg = self.prepare_auth_subscription_message(channel)
+        logger.debug(f'Sending subscription params: {json.dumps(sub_msg)}')
+        await self._subscribe(stream_type='gate_demo_futures', channel=channel, sub_msg=sub_msg)
+
+    async def subscribe_futures_orders_stream(self):
+        channel = "futures.orders"
+        sub_msg = self.prepare_auth_subscription_message(channel)
+        logger.debug(f'Sending subscription params: {json.dumps(sub_msg)}')
+        await self._subscribe(stream_type='gate_demo_futures', channel=channel, sub_msg=sub_msg)
+
+    async def subscribe_futures_usertrades_stream(self):
+        channel = "futures.usertrades"
+        sub_msg = self.prepare_auth_subscription_message(channel)
+        logger.debug(f'Sending subscription params: {json.dumps(sub_msg)}')
+        await self._subscribe(stream_type='gate_demo_futures', channel=channel, sub_msg=sub_msg)
 
 
 async def main(demo=False):
-    if demo:
-        bybit_private_url = "wss://stream-demo.bybit.com/v5/private"
-        okx_private_url = "wss://wspap.okx.com:8443/ws/v5/private"
-    else:
-        bybit_private_url = "wss://stream.bybit.com/v5/private"
-        okx_private_url = "wss://ws.okx.com:8443/ws/v5/private"
-
-    bybit_client = BybitWebSocketClient(urls = {"private": bybit_private_url},
-        demo=True)
-
-    okx_client = OkxWebSocketClient(
-        urls={"private": okx_private_url}, demo=True)
-
+    bybit_client = BybitWebSocketClient(demo=True)
+    okx_client = OkxWebSocketClient(demo=True)
+    gate_client = GateWebSocketClient(demo=True)
 
     async def manage_subscriptions():
-        # await asyncio.sleep(5)  # Подождем, пока установится соединение
-        # await bybit_client.subscribe("private", "position")
         await bybit_client.subscribe_order_stream()
         await okx_client.subscribe_order_stream()
-        # logger.info('Active subscriptions:', bybit_client.subscriptions)
+        await gate_client.subscribe_futures_orders_stream()
+        # logger.debug('Active subscriptions:', bybit_client.subscriptions)
 
     await asyncio.gather(
-        bybit_client.connect("private"),
-        okx_client.connect("private"),
-        # okx_client.connect("private"),
+        bybit_client.connect("private", auth_required=True),
+        okx_client.connect("private", auth_required=True),
+        gate_client.connect("gate_demo_futures", auth_required=True),
         manage_subscriptions()
     )
 
