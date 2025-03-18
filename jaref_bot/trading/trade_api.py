@@ -1,8 +1,6 @@
-from config import BYBIT_API_KEY, BYBIT_DEMO_API_KEY, BYBIT_SECRET_KEY, BYBIT_DEMO_SECRET_KEY
-from config import OKX_DEMO_API_KEY, OKX_DEMO_SECRET_KEY, OKX_DEMO_PASSPHRASE, OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE
-from config import GATE_API_KEY, GATE_SECRET_KEY, GATE_DEMO_API_KEY, GATE_DEMO_SECRET_KEY
-from config import host, user, password, db_name
-from jaref_bot.db.db_manager import DBManager
+from jaref_bot.config.credentials import host, user, password, db_name
+from jaref_bot.db.postgres_manager import DBManager
+from jaref_bot.config import credentials as cr
 from jaref_bot.data.http_api import ExchangeManager, BybitRestAPI, OKXRestAPI, GateIORestAPI
 
 from jaref_bot.core.exceptions.trading import SetLeverageError, PlaceOrderError
@@ -58,12 +56,12 @@ class BybitTrade(BaseTrade):
     def __init__(self, demo=False):
         self.demo = demo
         if self.demo:
-            self.api_key = BYBIT_DEMO_API_KEY
-            self.secret_key = BYBIT_DEMO_SECRET_KEY
+            self.api_key = cr.BYBIT_DEMO_API_KEY
+            self.secret_key = cr.BYBIT_DEMO_SECRET_KEY
             logger.debug('Demo-mode is on!')
         else:
-            self.api_key = BYBIT_API_KEY
-            self.secret_key = BYBIT_SECRET_KEY
+            self.api_key = cr.BYBIT_API_KEY
+            self.secret_key = cr.BYBIT_SECRET_KEY
             logger.debug('Demo-mode is off!')
 
         self.fees = {'linear_market': 0.001, 'linear_limit': 0.00036}
@@ -129,6 +127,7 @@ class BybitTrade(BaseTrade):
         return response
 
     def _position_handler(self, resp, market_type, order_type):
+        # print(resp)
         data = resp['result']['list'][0]
 
         token = data['symbol']
@@ -167,6 +166,7 @@ class BybitTrade(BaseTrade):
         url = f'{url}?{query}'
         response = requests.get(url=url, headers=headers).json()
 
+        # return response
         try:
             return self._position_handler(response, market_type, order_type)
         except InvalidOperation:
@@ -202,7 +202,6 @@ class BybitTrade(BaseTrade):
         else:
             url = 'https://api.bybit.com/v5/order/realtime'
 
-        # sym = self._create_symbol_name(symbol)
         curr_time = int(datetime.now().timestamp()*1000)
         query = f'category={market_type}&orderId={order_id}'
 
@@ -212,7 +211,27 @@ class BybitTrade(BaseTrade):
         url = f'{url}?{query}'
         response = requests.get(url=url, headers=headers).json()
 
-        # return response
+        try:
+            return self._order_handler(response, market_type)
+        except InvalidOperation:
+            return None
+
+    def _get_order_history(self, market_type, settle_coin, **kwargs):
+        if self.demo:
+            url = 'https://api-demo.bybit.com/v5/order/realtime'
+        else:
+            url = 'https://api.bybit.com/v5/order/realtime'
+
+        curr_time = int(datetime.now().timestamp()*1000)
+        query = f'category={market_type}&settleCoin={settle_coin}&limit=50'
+
+        sign = self.hashing(str(curr_time) + self.api_key + '5000' + query)
+        headers = self._prepare_headers(ts=curr_time, sign=sign)
+
+        url = f'{url}?{query}'
+        response = requests.get(url=url, headers=headers).json()
+
+        return response
         try:
             return self._order_handler(response, market_type)
         except InvalidOperation:
@@ -225,14 +244,14 @@ class OkxClient:
     def __init__(self, demo=True):
         self.demo = demo
         if self.demo:
-            self.api_key = OKX_DEMO_API_KEY
-            self.secret_key = OKX_DEMO_SECRET_KEY
-            self.passphrase = OKX_DEMO_PASSPHRASE
+            self.api_key = cr.OKX_DEMO_API_KEY
+            self.secret_key = cr.OKX_DEMO_SECRET_KEY
+            self.passphrase = cr.OKX_DEMO_PASSPHRASE
             logger.debug('Demo-mode is on!')
         else:
-            self.api_key = OKX_API_KEY
-            self.secret_key = OKX_SECRET_KEY
-            self.passphrase = OKX_PASSPHRASE
+            self.api_key = cr.OKX_API_KEY
+            self.secret_key = cr.OKX_SECRET_KEY
+            self.passphrase = cr.OKX_PASSPHRASE
             logger.debug('Demo-mode is off!')
 
         self.domain = 'https://www.okx.cab'
@@ -329,16 +348,19 @@ class OkxTrade(OkxClient, BaseTrade):
             'tdMode': margin_mode,   # Margin mode 'cross', 'isolated'; Non-Margin mode 'cash'
             'side': side,
             'ordType': order_type.lower(),
-            'sz': qty,
+            'sz': qty
         }
         if market_type == 'spot':
             body['tdMode'] = 'cash' # При торговле на споте 'tdMode' должен быть 'cash'
             body['tgtCcy'] = 'base_ccy' # Считаем qty считаем в базовой валюте
             body['banAmend'] = 'true'
-        else:
+        elif market_type == 'linear':
             body['sz'] /= ct_val
+            # body['posSide'] = 'net'
             if isinstance(ct_val, Decimal):
                 body['sz'] = body['sz'].to_eng_string()
+        else:
+            raise Exception('Unknown market_type. Should be "linear" or "spot".')
 
         response = self._request_with_params(method='POST',
                                              request_path='/api/v5/trade/order',
@@ -358,19 +380,21 @@ class OkxTrade(OkxClient, BaseTrade):
         assert margin_mode in ('isolated', 'cross'), 'margin_mode should be "isolated" or "cross"'
         sym = self._create_symbol_name(market_type, symbol)
 
-        body = {
-            'instId': sym,
-            'lever': str(lever),
-            'mgnMode': margin_mode,
-        }
-        response = self._request_with_params(method='POST',
-                                             request_path='/api/v5/account/set-leverage',
-                                             params=body)
-        if response['code'] == '0':
-            logger.debug(f'Okx {sym} leverage successfully set to {lever}')
-        else:
-            logger.error(f'[LEVERAGE ERROR] Okx {sym}')
-            raise SetLeverageError(f'При изменении плеча на бирже Okx возникла ошибка: {response['msg']}')
+        for ps in ('long', 'short'):
+            body = {
+                'instId': sym,
+                'lever': str(lever),
+                'mgnMode': margin_mode,
+                'posSide': ps
+            }
+            response = self._request_with_params(method='POST',
+                                                request_path='/api/v5/account/set-leverage',
+                                                params=body)
+            if response['code'] == '0':
+                logger.debug(f'Okx {sym} leverage successfully set to {lever}')
+            else:
+                logger.error(f'[LEVERAGE ERROR] Okx {sym}')
+                raise SetLeverageError(f'При изменении плеча на бирже Okx возникла ошибка: {response['msg']}')
         return response
 
     def _position_handler(self, resp, market_type, order_type, ct_val):
@@ -443,7 +467,7 @@ class OkxTrade(OkxClient, BaseTrade):
         sym = self._create_symbol_name(market_type, symbol)
         params = {'instId': sym, 'mgnMode': margin_mode, 'posSide': posSide, 'ccy': ccy, 'autoCxl': autoCxl,
                   'clOrdId': clOrdId, 'tag': tag}
-        print(sym)
+        # print(sym)
         return self._request_with_params('POST', request_path='/api/v5/trade/close-position', params=params)
 
     # def amend_order(self, instId, cxlOnFail='', ordId='', clOrdId='', reqId='', newSz='', newPx='', newTpTriggerPx='',
@@ -463,12 +487,12 @@ class GateTrade(BaseTrade):
     def __init__(self, demo=False):
         self.demo = demo
         if self.demo:
-            self.api_key = GATE_DEMO_API_KEY
-            self.secret_key = GATE_DEMO_SECRET_KEY
+            self.api_key = cr.GATE_DEMO_API_KEY
+            self.secret_key = cr.GATE_DEMO_SECRET_KEY
             logger.debug('Demo-mode is on!')
         else:
-            self.api_key = GATE_API_KEY
-            self.secret_key = GATE_SECRET_KEY
+            self.api_key = cr.GATE_API_KEY
+            self.secret_key = cr.GATE_SECRET_KEY
             logger.debug('Demo-mode is off!')
 
     def _create_symbol_name(self, symbol):
@@ -493,7 +517,7 @@ class GateTrade(BaseTrade):
                 host = "https://fx-api-testnet.gateio.ws"
         else:
             if market_type == 'linear':
-                host = "https://api.gateio.ws/api/v4"
+                host = "https://api.gateio.ws"
 
         prefix = "/api/v4"
         headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
@@ -513,7 +537,14 @@ class GateTrade(BaseTrade):
         sign_headers = self.gen_sign('POST', prefix + url, query_param, body)
         headers.update(sign_headers)
 
-        response = requests.request('POST', host + prefix + url, headers=headers, data=body).json()
+        response = requests.request('POST', host + prefix + url, headers=headers, data=body)
+        # print(response)
+
+        try:
+            response = response.json()
+        except ValueError:
+            return response
+
         order_id = response.get('id')
         if order_id:
             logger.debug(f'[PLACE ORDER] Gate {market_type=} {symbol=} {order_id=}')
@@ -540,7 +571,10 @@ class GateTrade(BaseTrade):
         headers.update(sign_headers)
         response = requests.request('POST', host + prefix + url + "?" + query_param,
                                     headers=headers).json()
-        if response.get('leverage'):
+        # return response
+        if type(response) == dict and response.get('leverage'):
+            logger.debug(f'Gate {symbol} leverage successfully set to {lever}')
+        elif type(response) == list and response[0].get('leverage'):
             logger.debug(f'Gate {symbol} leverage successfully set to {lever}')
         else:
             logger.error(f'[LEVERAGE ERROR] Gate {symbol}')
@@ -548,11 +582,15 @@ class GateTrade(BaseTrade):
         return response
 
     def _position_handler(self, resp, market_type, order_type, ct_val):
+        # print(resp)
+        if type(resp) == list:
+            resp = resp[0]
+
         token = resp['contract']
 
         leverage = Decimal(resp['leverage'])
         price = Decimal(resp['entry_price'])
-        usdt_amount = Decimal(resp['value'])
+        usdt_amount = Decimal(resp['value']) - Decimal(resp['unrealised_pnl'])
         side = 'buy' if float(resp['size']) > 0 else 'sell'
         qty = abs(Decimal(resp['size']) * ct_val)
 
@@ -561,6 +599,8 @@ class GateTrade(BaseTrade):
         return {'exchange': 'gate', 'market_type': market_type, 'order_type': order_type,
                 'token': token, 'leverage': leverage, 'price': price,
                 'usdt_amount': usdt_amount, 'qty': qty, 'order_side': side, 'fee': fee}
+        # except TypeError:
+        #     print(type(resp), resp)
 
     def _get_position(self, market_type, symbol, order_type, ct_val):
         if self.demo:
@@ -580,7 +620,7 @@ class GateTrade(BaseTrade):
         headers.update(sign_headers)
         response = requests.request('GET', host + prefix + url + "?" + query_param,
                                     headers=headers).json()
-
+        # return response
         try:
             return self._position_handler(response, market_type, order_type, ct_val)
         except InvalidOperation:

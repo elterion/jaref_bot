@@ -29,7 +29,7 @@ class ExchangeRestAPI(ABC):
         self.category = category
         assert self.category in ('spot', 'linear'), 'category should be "spot" or "linear"'
 
-    async def _send_request(self, session, endpoint, params=None, n_tries=20,  base_delay=1, timeout=10):
+    async def _send_request(self, session, endpoint, params=None, n_tries=50,  base_delay=1, timeout=10):
         params = params or {}
         # reconnect_delay = 1
         for attempt in range(1, n_tries + 1):
@@ -41,8 +41,9 @@ class ExchangeRestAPI(ABC):
                         # reconnect_delay = 1
                         return await response.json()
             except (asyncio.TimeoutError, ClientError) as e:
+                print('.', end='')
                 if attempt > 1:
-                    logger.warning(f"Ошибка соединения: {self.BASE_URL + endpoint}. Попытка {attempt}/{n_tries}. {e}")
+                    logger.debug(f"Ошибка соединения: {self.BASE_URL + endpoint}. Попытка {attempt}/{n_tries}. {e}")
 
                 await asyncio.sleep(5)
                 # reconnect_delay = min(reconnect_delay * 2, 60)

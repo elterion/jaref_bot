@@ -1,9 +1,226 @@
 import pandas as pd
+import polars as pl
 from copy import deepcopy
 from decimal import Decimal
 
 
-def find_tokens_to_open_order(current_data: pd.DataFrame,
+def get_best_prices(orderbook_data: pl.DataFrame) -> pl.DataFrame:
+    return orderbook_data.rename({"symbol": "token"}).select([
+        pl.col("exchange"),
+        pl.col("token"),
+        pl.col("bidprice_0"),
+        pl.col("askprice_0"),
+        ]).group_by(["exchange", "token"]
+        ).agg([
+          pl.col("askprice_0").min().alias("ask"),
+          pl.col("bidprice_0").max().alias("bid")
+      ])
+
+def find_tokens_to_open_order(current_data,
+                              stats_data,
+                              max_mean,
+                              min_std,
+                              std_coef,
+                              min_edge,
+                              min_dist):
+    best_prices = get_best_prices(current_data)
+    return best_prices.join(best_prices, on="token", how="full",
+                            coalesce=True, suffix='_short'
+        ).filter(pl.col('exchange') != pl.col('exchange_short')
+        ).rename({"exchange": "long_exc", "ask": "ask_long", "bid": "bid_long",
+                  "exchange_short": "short_exc"}
+        ).with_columns(
+           ((pl.col('bid_short') / pl.col('ask_long') - 1) * 100).alias('curr_diff')
+        ).join(stats_data, on=["token", "long_exc", "short_exc"], how="inner"
+        ).filter(pl.col('std') > min_std
+        ).filter(pl.col('mean') < max_mean
+        ).with_columns([
+            (pl.col('mean') + std_coef * pl.col('std')).alias('thresh'),
+            ((pl.col('curr_diff') - pl.col('mean')) / pl.col('std')).alias('dev')
+            ]
+        ).filter((pl.col('curr_diff') > pl.col('thresh')) & (pl.col('curr_diff') > min_edge)
+        ).with_columns((pl.col('mean') + 2.5 * pl.col('std') + pl.col('cmean') + 1.5 * pl.col('cstd')).alias('dist')
+        ).filter((pl.col('dev') > std_coef) & (pl.col('curr_diff') > min_edge) & (pl.col('dist') > min_dist)
+        ).select('token', 'long_exc', 'short_exc', 'ask_long', 'bid_short',
+                 'mean', 'std', 'thresh', 'curr_diff', 'dev', 'cmean', 'cstd', 'dist')
+
+def find_tokens_to_close_order(current_data,
+                                current_orders,
+                                stats_data,
+                                std_coef=None,
+                                min_profit=None,
+                                min_edge=None):
+    best_prices = get_best_prices(current_data)
+
+    try:
+        agg = current_orders.join(best_prices, on=("token", "exchange"), how="inner"
+            ).pivot(index="token", on="order_side",
+                values=["ask", "bid", 'exchange', 'qty', 'usdt_amount', 'usdt_fee', 'leverage']
+            ).with_columns([
+                ((pl.col('bid_buy') / pl.col('ask_sell') - 1) * 100).alias('diff'),
+                (pl.col('usdt_fee_buy') + pl.col('usdt_fee_sell')).alias('usdt_fee_open')
+            ]).rename(
+                {'exchange_buy': 'long_exc', 'exchange_sell': 'short_exc', 'qty_buy': 'qty',
+                'ask_sell': 'short_price', 'bid_buy': 'long_price', 'leverage_buy': 'leverage'}
+            ).join(stats_data, on=('token', 'long_exc', 'short_exc'), how="inner"
+            ).with_columns([
+                (pl.col('qty') * pl.col('long_price') - pl.col('usdt_amount_buy')).alias('lm_profit'),
+                (pl.col('usdt_amount_sell') - pl.col('qty') * pl.col('short_price')).alias('sm_profit')
+            ]).with_columns([
+                ((pl.col('lm_profit') + pl.col('sm_profit') - 2 * pl.col('usdt_fee_open')) * pl.col('leverage')).alias('profit'),
+                ((pl.col('diff') - pl.col('cmean')) / pl.col('cstd')).alias('deviation')
+            ]).drop(['qty_sell', 'leverage_sell',
+                    'usdt_fee_buy', 'usdt_fee_sell', 'usdt_fee_open', 'usdt_amount_buy',
+                    'usdt_amount_sell', 'short_price', 'long_price', 'leverage',
+                    'ask_buy', 'bid_sell'])
+    except pl.exceptions.ColumnNotFoundError:
+        return None
+
+    return agg.filter((pl.col('deviation') > std_coef) &
+                      (pl.col('cmean') + std_coef * pl.col('cstd') > min_edge))
+
+def get_open_volume(long_orderbook, short_orderbook, min_edge, max_usdt, debug=False):
+    total_volume = 0
+    total_buy_amount = 0
+    total_sell_amount = 0
+    sell_idx = 0
+    buy_idx = 0
+    edge = None
+
+    sell_bids = deepcopy(short_orderbook)
+    buy_asks = deepcopy(long_orderbook)
+
+    while sell_idx < len(sell_bids) and buy_idx < len(buy_asks):
+        best_bid_price, best_bid_volume = sell_bids[sell_idx]
+        best_ask_price, best_ask_volume = buy_asks[buy_idx]
+
+        current_edge = (best_bid_price / best_ask_price - 1) * 100
+        if debug:
+            print(f'short vol: {best_bid_volume}, price: {best_bid_price}; long vol: {best_ask_volume}, price: {best_ask_price}; edge: {current_edge:.3f}', end=': ')
+
+        if current_edge < min_edge:
+            if debug:
+                print('break')
+            break  # Дальнейшие уровни не подходят
+        if debug:
+            print()
+
+        edge = current_edge
+
+        max_possible_volume = min(best_bid_volume, best_ask_volume)
+        potential_cost = best_ask_price * max_possible_volume
+
+        if debug:
+            print(f'{max_possible_volume=}; {potential_cost=}')
+
+        # Проверяем, не превысит ли это max_usdt
+        if total_buy_amount + potential_cost > max_usdt:
+            remaining = max_usdt - total_buy_amount
+            if remaining <= 0:
+                break
+            volume = remaining / best_ask_price
+            max_possible_volume = min(volume, max_possible_volume)
+            potential_cost = best_ask_price * max_possible_volume
+            if debug:
+                print(f'Overflow. {remaining=}; {volume=}; {max_possible_volume=}; {potential_cost=}')
+
+        # Обновляем общие показатели
+        total_buy_amount += potential_cost
+        total_sell_amount += best_bid_price * max_possible_volume
+        total_volume += max_possible_volume
+
+        # Обновляем объёмы в ордербуках
+        sell_bids[sell_idx][1] -= max_possible_volume
+        buy_asks[buy_idx][1] -= max_possible_volume
+
+        if debug:
+            print(f'possible volume at this level: sell {sell_bids[sell_idx][1]}; buy {buy_asks[buy_idx][1]}')
+
+        # Переходим к следующим уровням, если текущие исчерпаны
+        if sell_bids[sell_idx][1] <= 0:
+            sell_idx += 1
+        if buy_asks[buy_idx][1] <= 0:
+            buy_idx += 1
+
+        if debug:
+            print(f'end of iteration. {total_volume=}')
+
+        if total_buy_amount >= max_usdt:
+            break
+
+    return {'edge': edge, 'volume': total_volume, 'usdt_amount': total_buy_amount}
+
+def get_close_volume(long_orderbook, short_orderbook, diff_edge, min_qty, max_qty, debug=False):
+    total_volume = 0
+    sell_idx = 0
+    buy_idx = 0
+    edge = None
+
+    sell_bids = deepcopy(long_orderbook)
+    buy_asks = deepcopy(short_orderbook)
+
+    first_iter_flag = True
+
+    while sell_idx < len(sell_bids) and buy_idx < len(buy_asks):
+        best_bid_price, best_bid_volume = sell_bids[sell_idx]
+        best_ask_price, best_ask_volume = buy_asks[buy_idx]
+
+        current_edge = (best_bid_price / best_ask_price - 1) * 100
+        if debug:
+            print(f'bid: {best_bid_price}, vol: {best_bid_volume}; ask: {best_ask_price}, vol: {best_ask_volume}; edge: {current_edge:.3f}; {diff_edge=:.3f}; {first_iter_flag=}', end=': ')
+        if current_edge < diff_edge:
+            if first_iter_flag:
+                return {'edge': None, 'volume': Decimal('0')}
+
+            if debug:
+                print('break')
+            break  # Дальнейшие уровни не подходят
+        if debug:
+            print()
+
+        edge = current_edge
+
+        max_possible_volume = min(best_bid_volume, best_ask_volume)
+        if debug:
+            print(f'possible volume: {max_possible_volume}')
+
+        # Проверяем, не превысит ли это max_usdt
+        if total_volume + max_possible_volume > max_qty:
+            remaining = max_qty - total_volume
+            if debug:
+                print(f'{total_volume=}; {remaining=}')
+            if remaining <= min_qty:
+                break
+            max_possible_volume = min(remaining, max_possible_volume)
+
+        # Обновляем общие показатели
+        total_volume += max_possible_volume
+
+        # Обновляем объёмы в ордербуках
+        sell_bids[sell_idx][1] -= max_possible_volume
+        buy_asks[buy_idx][1] -= max_possible_volume
+
+        if debug:
+            print(f'possible volume at this level: sell {sell_bids[sell_idx][1]}; buy {buy_asks[buy_idx][1]}')
+
+        # Переходим к следующим уровням, если текущие исчерпаны
+        if sell_bids[sell_idx][1] <= 0:
+            sell_idx += 1
+        if buy_asks[buy_idx][1] <= 0:
+            buy_idx += 1
+
+        if debug:
+            print(f'end of iteration. {total_volume=}')
+
+        if total_volume >= max_qty:
+            break
+
+        first_iter_flag = False
+
+    return {'edge': edge, 'volume': total_volume}
+
+# ============== Legacy =================
+def find_tokens_to_open_order_from_tickers(current_data: pd.DataFrame,
                    stats_data: pd.DataFrame,
                    max_mean: float,
                    min_std: float,
@@ -67,7 +284,7 @@ def find_tokens_to_open_order(current_data: pd.DataFrame,
                            'mean_out', 'std_out', 'curr_diff_out', 'dev_in']]
     return result_df
 
-def find_tokens_to_close_order(current_data,
+def find_tokens_to_close_order_pandas(current_data,
                                          current_orders,
                                          stats_data,
                                          close_edge=None,
@@ -142,73 +359,7 @@ def find_tokens_to_close_order(current_data,
 
     return result.drop_duplicates()
 
-def get_open_volume(long_orderbook, short_orderbook, min_edge, max_usdt, debug=False):
-    total_volume = Decimal('0')
-    total_buy_amount = Decimal('0')
-    total_sell_amount = Decimal('0')
-    sell_idx = 0
-    buy_idx = 0
-    edge = None
-
-    sell_bids = deepcopy(short_orderbook)
-    buy_asks = deepcopy(long_orderbook)
-
-    while sell_idx < len(sell_bids) and buy_idx < len(buy_asks):
-        best_bid_price, best_bid_volume = sell_bids[sell_idx]
-        best_ask_price, best_ask_volume = buy_asks[buy_idx]
-
-        current_edge = (best_bid_price / best_ask_price - 1) * 100
-        if debug:
-            print(f'short vol: {best_bid_volume}, price: {best_bid_price}; long vol: {best_ask_volume}, price: {best_ask_price}; edge: {current_edge:.3f}', end=': ')
-
-        if current_edge < min_edge:
-            if debug:
-                print('break')
-            break  # Дальнейшие уровни не подходят
-        if debug:
-            print()
-
-        edge = current_edge
-
-        max_possible_volume = min(best_bid_volume, best_ask_volume)
-        potential_cost = best_ask_price * max_possible_volume
-
-        if debug:
-            print(f'{max_possible_volume=}; {potential_cost=}')
-
-        # Проверяем, не превысит ли это max_usdt
-        if total_buy_amount + potential_cost > max_usdt:
-            remaining = max_usdt - total_buy_amount
-            if remaining <= Decimal('0'):
-                break
-            volume = remaining / best_ask_price
-            max_possible_volume = min(volume, max_possible_volume)
-            potential_cost = best_ask_price * max_possible_volume
-            if debug:
-                print(f'Overflow. {remaining=}; {volume=}; {max_possible_volume=}; {potential_cost=}')
-
-        # Обновляем общие показатели
-        total_buy_amount += potential_cost
-        total_sell_amount += best_bid_price * max_possible_volume
-        total_volume += max_possible_volume
-
-        # Обновляем объёмы в ордербуках
-        sell_bids[sell_idx][1] -= max_possible_volume
-        buy_asks[buy_idx][1] -= max_possible_volume
-
-        if debug:
-            print(f'possible volume at this level: sell {sell_bids[sell_idx][1]}; buy {buy_asks[buy_idx][1]}')
-
-        # Переходим к следующим уровням, если текущие исчерпаны
-        if sell_bids[sell_idx][1] <= Decimal('0'):
-            sell_idx += 1
-        if buy_asks[buy_idx][1] <= Decimal('0'):
-            buy_idx += 1
-
-        if debug:
-            print(f'end of iteration. {total_volume=}')
-
-        if total_buy_amount >= max_usdt:
-            break
-
-    return {'edge': edge, 'volume': total_volume, 'usdt_amount': total_buy_amount}
+# async def fetch_all_orderbooks(tokens, limit=10):
+#     tasks = [exc_manager.get_orderbook(symbol=token, limit=limit) for token in tokens]
+#     results = await asyncio.gather(*tasks)
+#     return dict(zip(tokens, results))

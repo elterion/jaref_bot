@@ -6,12 +6,12 @@ def get_step_info(coin_information, token, long_exc, short_exc):
         qty_long_step = coin_information[long_exc][token]['qty_step']
     except KeyError:
         print(f'Не могу найти токен "{token}" для биржи {long_exc}')
-    
+
     try:
         qty_short_step = coin_information[short_exc][token]['qty_step']
     except KeyError:
         print(f'Не могу найти токен "{token}" для биржи {short_exc}')
-    
+
     return max(qty_long_step, qty_short_step)
 
 def get_min_qty(coin_information, token, long_exc, short_exc):
@@ -19,12 +19,12 @@ def get_min_qty(coin_information, token, long_exc, short_exc):
         qty_long_step = coin_information[long_exc][token]['min_qty']
     except KeyError:
         print(f'Не могу найти токен "{token}" для биржи {long_exc}')
-    
+
     try:
         qty_short_step = coin_information[short_exc][token]['min_qty']
     except KeyError:
         print(f'Не могу найти токен "{token}" для биржи {short_exc}')
-    
+
     return max(qty_long_step, qty_short_step)
 
 def round_volume(volume: Decimal, qty_step: Decimal) -> Decimal:
@@ -35,6 +35,11 @@ def round_volume(volume: Decimal, qty_step: Decimal) -> Decimal:
         которое соответствует количеству знаков в qty_step.
       - Если qty_step > 1: округляем volume до ближайшего меньшего числа, кратного qty_step.
     """
+    if not isinstance(volume, Decimal):
+        volume = Decimal(volume)
+    if not isinstance(qty_step, Decimal):
+        qty_step = Decimal(qty_step)
+
     if qty_step == Decimal("1"):
         return Decimal(int(volume))
     elif qty_step < Decimal("1"):

@@ -1,5 +1,5 @@
 import requests
-from config import coin_market_cap_api
+from jaref_bot.config.credentials import coin_market_cap_api
 
 def get_top_tokens(api_key=coin_market_cap_api,
                    limit=300, output_file=None):
