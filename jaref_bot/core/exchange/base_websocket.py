@@ -16,6 +16,8 @@ logging.basicConfig(format="%(message)s", level=logging.INFO)
 logger = logging.getLogger()
 
 class BaseWebSocketClient(ABC):
+    DB_NUM = {'orderbooks': 0, 'prices': 1, 'orders': 2}
+
     def __init__(self, demo: bool = False):
         self.demo = demo
         self.connections = {}  # Хранение активных соединений
@@ -53,7 +55,6 @@ class BaseWebSocketClient(ABC):
         pass
 
     async def connect(self, stream_type: str, auth_required=False):
-        ct = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         endpoint = self.get_endpoint(stream_type)
         url = self.load_urls(endpoint)
         if not url:
@@ -80,12 +81,15 @@ class BaseWebSocketClient(ABC):
                 logger.error(f'{self.exchange} connection closed!')
             except socket.gaierror as err:
                 logger.error(f'{ct} Отсутствует подключение')
+            except Exception as err:
+                logger.error(f'{ct} Что-то пошло не так, но я попробую подключиться заново...')
 
             self.connected = False
 
             await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 60)
+            reconnect_delay = min(reconnect_delay * 2, 30)
 
+            ct = datetime.now().strftime('%H:%M:%S')
             logger.error(f'{ct} Переподключение.')
 
     async def resubscribe(self, endpoint: str):

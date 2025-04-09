@@ -27,6 +27,14 @@ def get_min_qty(coin_information, token, long_exc, short_exc):
 
     return max(qty_long_step, qty_short_step)
 
+def get_price_scale(coin_information, token, exc_full):
+    try:
+        price_scale = coin_information[exc_full][token]['price_scale']
+    except KeyError:
+        print(f'Не могу найти токен "{token}" для биржи {exc_full}')
+
+    return 1 / 10**price_scale
+
 def round_volume(volume: Decimal, qty_step: Decimal) -> Decimal:
     """
     Округляет значение volume в зависимости от qty_step:

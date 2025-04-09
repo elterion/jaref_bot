@@ -25,15 +25,35 @@ logger = logging.getLogger()
 getcontext().prec = 8
 
 class BaseTrade:
-    def market_order(self, market_type, symbol, side, order_type, qty, ct_val=1,
-                     margin_mode='isolated'):
+    def place_market_order(self, market_type, symbol, side, qty, ct_val=1,
+                     margin_mode='isolated', stop_loss=None, **kwargs):
         market_type = market_type.lower()
         side = side.lower()
         assert market_type in ('linear', 'spot'), 'market_type should be "linear" or "spot"'
         assert side in ('buy', 'sell'), 'side should be "buy" or "sell"'
 
-        response = self._market_order(market_type=market_type, symbol=symbol, side=side,
-            order_type=order_type, qty=qty, ct_val=ct_val, margin_mode=margin_mode)
+        response = self._place_market_order(market_type=market_type, symbol=symbol, side=side,
+            qty=qty, stop_loss=stop_loss, ct_val=ct_val, margin_mode=margin_mode)
+        return response
+
+    def place_limit_order(self, market_type, symbol, side, qty, price, ct_val=1,
+                     margin_mode='isolated', stop_loss=None, **kwargs):
+        market_type = market_type.lower()
+        side = side.lower()
+        assert market_type in ('linear', 'spot'), 'market_type should be "linear" or "spot"'
+        assert side in ('buy', 'sell'), 'side should be "buy" or "sell"'
+
+        response = self._place_limit_order(market_type=market_type, symbol=symbol, side=side,
+            qty=qty, price=price, stop_loss=stop_loss, ct_val=ct_val, margin_mode=margin_mode)
+        return response
+
+    def cancel_order(self, market_type, symbol, order_id, **kwargs):
+        market_type = market_type.lower()
+        assert market_type in ('linear', 'spot'), 'market_type should be "linear" or "spot"'
+
+        response = self._cancel_order(market_type=market_type,
+                                      symbol=symbol,
+                                      order_id=order_id)
         return response
 
     def set_leverage(self, market_type, symbol, lever):
@@ -58,10 +78,12 @@ class BybitTrade(BaseTrade):
         if self.demo:
             self.api_key = cr.BYBIT_DEMO_API_KEY
             self.secret_key = cr.BYBIT_DEMO_SECRET_KEY
+            self.main_url = 'https://api-demo.bybit.com'
             logger.debug('Demo-mode is on!')
         else:
             self.api_key = cr.BYBIT_API_KEY
             self.secret_key = cr.BYBIT_SECRET_KEY
+            self.main_url = 'https://api.bybit.com'
             logger.debug('Demo-mode is off!')
 
         self.fees = {'linear_market': 0.001, 'linear_limit': 0.00036}
@@ -82,21 +104,28 @@ class BybitTrade(BaseTrade):
         }
         return headers
 
-    def _market_order(self, market_type, symbol, side, order_type, qty, ct_val=1,
-                     margin_mode='isolated'):
-        side = side.capitalize()
-        if self.demo:
-            url = 'https://api-demo.bybit.com/v5/order/create'
-        else:
-            url = 'https://api.bybit.com/v5/order/create'
+    def _place_order(self, market_type,
+                      symbol,
+                      side,
+                      order_type,
+                      qty,
+                      price=None,
+                      stop_loss=None,
+                      **kwargs):
+        url = self.main_url + '/v5/order/create'
 
         sym = self._create_symbol_name(symbol)
+        side = side.capitalize()
+        price = price if price else ''
         curr_time = int(datetime.now().timestamp()*1000)
-        data = '{' + f'"category": "{market_type}","symbol": "{sym}","side": "{side}","orderType": "{order_type}","qty": "{qty}"' + '}'
+        data = '{' + f'"category": "{market_type}","symbol": "{sym}","side": "{side}","orderType": "{order_type}","qty": "{qty}","price": "{price}"' + '}'
+        if stop_loss:
+            data = data[:-1] + f',"stopLoss": "{stop_loss}"' + '}'
+
         sign = self.hashing(str(curr_time) + self.api_key + '5000' + data)
         headers = self._prepare_headers(ts=curr_time, sign=sign)
-
         response = requests.post(url=url, headers=headers, data=data).json()
+
         order_id = response.get('result', {}).get('orderId')
         if order_id:
             logger.debug(f'[PLACE ORDER] Bybit {market_type=} {sym=} {order_id=}')
@@ -105,11 +134,42 @@ class BybitTrade(BaseTrade):
             logger.error(f'[ORDER ERROR] Bybit {market_type=} {sym=}')
             raise PlaceOrderError(f'При постановке ордера на бирже Bybit возникла ошибка: {response['retMsg']}')
 
-    def _set_leverage(self, market_type, symbol, lever):
-        if self.demo:
-            url = 'https://api-demo.bybit.com/v5/position/set-leverage'
+    def _place_market_order(self, market_type, symbol, side, qty, stop_loss=None, **kwargs):
+        return self._place_order(market_type=market_type,
+                      symbol=symbol,
+                      side=side,
+                      order_type='market',
+                      qty=qty,
+                      stop_loss=stop_loss)
+
+    def _place_limit_order(self, market_type, symbol, side, qty, price, stop_loss=None, **kwargs):
+        return self._place_order(market_type=market_type,
+                      symbol=symbol,
+                      side=side,
+                      order_type='limit',
+                      qty=qty,
+                      price=price,
+                      stop_loss=stop_loss)
+
+    def _cancel_order(self, market_type, symbol, order_id, **kwargs):
+        url = self.main_url + '/v5/order/cancel'
+        sym = self._create_symbol_name(symbol)
+        curr_time = int(datetime.now().timestamp()*1000)
+        data = '{' + f'"category": "{market_type}","symbol": "{sym}","orderId": "{order_id}"' + '}'
+        sign = self.hashing(str(curr_time) + self.api_key + '5000' + data)
+        headers = self._prepare_headers(ts=curr_time, sign=sign)
+
+        response = requests.post(url=url, headers=headers, data=data).json()
+        order_id = response.get('result', {}).get('orderId')
+        if response.get('retCode') == 0 and response.get('retMsg') == 'OK':
+            logger.debug(f'[CANCEL ORDER] Bybit {market_type=} {sym=} {order_id=}')
+            return order_id
         else:
-            url = 'https://api.bybit.com/v5/position/set-leverage'
+            logger.error(f'[ORDER ERROR] Bybit {market_type=} {sym=}')
+            raise PlaceOrderError(f'При отмене ордера на бирже Bybit возникла ошибка: {response['retMsg']}')
+
+    def _set_leverage(self, market_type, symbol, lever):
+        url = self.main_url + '/v5/position/set-leverage'
 
         sym = self._create_symbol_name(symbol)
         curr_time = int(datetime.now().timestamp()*1000)
@@ -136,25 +196,26 @@ class BybitTrade(BaseTrade):
 
         leverage = Decimal(data['leverage'])
         price = Decimal(data['avgPrice'])
-        usdt_amount = Decimal(data['positionValue'])
+        usdt_amount = Decimal(data['positionValue']) # Начальная стоимость в usdt. Да, проверил.
         side = data['side'].lower()
         size = Decimal(data['size'])
 
         fee_perc = Decimal(self.fees[market_type + '_' + order_type])
         fee = (usdt_amount * fee_perc).normalize()
 
+        realized_pnl = Decimal(data['curRealisedPnl'])
+        unrealized_pnl = Decimal(data['unrealisedPnl'])
+
         return {'exchange': 'bybit', 'market_type': market_type, 'order_type': order_type,
                 'token': token, 'leverage': leverage, 'price': price,
-                'usdt_amount': usdt_amount, 'qty': size, 'order_side': side, 'fee': fee}
+                'usdt_amount': usdt_amount, 'qty': size, 'order_side': side, 'fee': fee,
+                'realized_pnl': realized_pnl, 'unrealized_pnl': unrealized_pnl}
 
     def _get_position(self, market_type, symbol, order_type, **kwargs):
         """
         Возвращает информацию по открытой позиции
         """
-        if self.demo:
-            url = 'https://api-demo.bybit.com/v5/position/list'
-        else:
-            url = 'https://api.bybit.com/v5/position/list'
+        url = self.main_url + '/v5/position/list'
 
         sym = self._create_symbol_name(symbol)
         curr_time = int(datetime.now().timestamp()*1000)
@@ -183,24 +244,20 @@ class BybitTrade(BaseTrade):
             raise NotImplementedError
 
         order_type = data['orderType'].lower()
-        price = Decimal(data['avgPrice'])
+        status = data['orderStatus'].lower()
+        price = Decimal(data['avgPrice']) # Цена по которой ордер сматчился
+        limit_price = Decimal(data['price']) # Заявочная цена для лимитного ордера
         usdt_amount = Decimal(data['cumExecValue'])
         side = data['side'].lower()
         size = Decimal(data['cumExecQty'])
-        # print(f'Order handler: {size=}, {price=}, {usdt_amount=}')
-
-        fee_perc = Decimal(self.fees[market_type + '_' + order_type])
-        fee = (usdt_amount * fee_perc).normalize()
+        fee = Decimal(data['cumExecFee'])
 
         return {'exchange': 'bybit', 'market_type': market_type, 'order_type': order_type,
-                'token': token, 'price': price,
+                'status': status, 'token': token, 'price': price, 'limit_price': limit_price,
                 'usdt_amount': usdt_amount, 'qty': size, 'order_side': side, 'fee': fee}
 
     def _get_order(self, market_type, order_id, **kwargs):
-        if self.demo:
-            url = 'https://api-demo.bybit.com/v5/order/realtime'
-        else:
-            url = 'https://api.bybit.com/v5/order/realtime'
+        url = self.main_url + '/v5/order/realtime'
 
         curr_time = int(datetime.now().timestamp()*1000)
         query = f'category={market_type}&orderId={order_id}'
@@ -211,16 +268,14 @@ class BybitTrade(BaseTrade):
         url = f'{url}?{query}'
         response = requests.get(url=url, headers=headers).json()
 
+        # return response
         try:
             return self._order_handler(response, market_type)
         except InvalidOperation:
             return None
 
     def _get_order_history(self, market_type, settle_coin, **kwargs):
-        if self.demo:
-            url = 'https://api-demo.bybit.com/v5/order/realtime'
-        else:
-            url = 'https://api.bybit.com/v5/order/realtime'
+        url = self.main_url + '/v5/order/realtime'
 
         curr_time = int(datetime.now().timestamp()*1000)
         query = f'category={market_type}&settleCoin={settle_coin}&limit=50'
@@ -330,7 +385,16 @@ class OkxTrade(OkxClient, BaseTrade):
     def __init__(self, demo=True):
         OkxClient.__init__(self, demo=demo)
 
-    def _market_order(self, market_type, symbol, side, order_type, qty, ct_val=1, margin_mode='isolated'):
+    def _place_order(self, market_type,
+                     symbol,
+                     side,
+                     order_type,
+                     qty,
+                     price=None,
+                     stop_loss=None,
+                     ct_val=1,
+                     margin_mode='isolated',
+                     **kwargs):
         """
         docs: https://www.okx.com/docs-v5/en/#order-book-trading-trade-post-place-order
 
@@ -343,17 +407,20 @@ class OkxTrade(OkxClient, BaseTrade):
         :params margin_mode: вид маржи ('isolated', 'cross')
         """
         sym = self._create_symbol_name(market_type, symbol)
+        price = price if price else ''
+        if isinstance(price, Decimal):
+            price = price.normalize().to_eng_string()
         body = {
             'instId': sym,
             'tdMode': margin_mode,   # Margin mode 'cross', 'isolated'; Non-Margin mode 'cash'
             'side': side,
             'ordType': order_type.lower(),
-            'sz': qty
+            'sz': qty,
+            'px': price
         }
         if market_type == 'spot':
             body['tdMode'] = 'cash' # При торговле на споте 'tdMode' должен быть 'cash'
             body['tgtCcy'] = 'base_ccy' # Считаем qty считаем в базовой валюте
-            body['banAmend'] = 'true'
         elif market_type == 'linear':
             body['sz'] /= ct_val
             # body['posSide'] = 'net'
@@ -362,6 +429,12 @@ class OkxTrade(OkxClient, BaseTrade):
         else:
             raise Exception('Unknown market_type. Should be "linear" or "spot".')
 
+        if stop_loss:
+            if isinstance(stop_loss, Decimal):
+                stop_loss = stop_loss.to_eng_string()
+            body['attachAlgoOrds'] = {'slTriggerPx': stop_loss, 'slOrdPx': '-1'}
+
+        # print(body)
         response = self._request_with_params(method='POST',
                                              request_path='/api/v5/trade/order',
                                              params=body)
@@ -376,6 +449,48 @@ class OkxTrade(OkxClient, BaseTrade):
 
         return order_id
 
+    def _place_market_order(self, market_type, symbol, side, qty, ct_val,
+                            stop_loss=None, margin_mode='isolated'):
+        return self._place_order(market_type=market_type,
+                                        symbol=symbol,
+                                        side=side,
+                                        order_type='market',
+                                        qty=qty,
+                                        stop_loss=stop_loss,
+                                        ct_val=ct_val,
+                                        margin_mode=margin_mode)
+
+    def _place_limit_order(self, market_type, symbol, side, qty, price, ct_val,
+                           stop_loss=None, margin_mode='isolated'):
+        return self._place_order(market_type=market_type,
+                                        symbol=symbol,
+                                        side=side,
+                                        order_type='limit',
+                                        qty=qty,
+                                        price=price,
+                                        stop_loss=stop_loss,
+                                        ct_val=ct_val,
+                                        margin_mode=margin_mode)
+
+    def _cancel_order(self, symbol, market_type, order_id='', **kwargs):
+        sym = self._create_symbol_name(market_type, symbol)
+        body = {
+            'instId': sym,
+            'ordId': order_id
+        }
+
+        response = self._request_with_params(method='POST',
+                                             request_path='/api/v5/trade/cancel-order',
+                                             params=body)
+
+        order_id = response.get('data', [])[0].get('ordId', None)
+        if response.get('code') == '0':
+            logger.debug(f'[CANCEL ORDER] Okx {market_type=} {sym=} {order_id=}')
+            return order_id
+        else:
+            logger.error(f'[ORDER ERROR] Okx {market_type=} {sym=}')
+            raise PlaceOrderError(f'При отмене ордера на бирже Okx возникла ошибка: {response['msg']}')
+
     def _set_leverage(self, market_type, symbol, lever, margin_mode='isolated'):
         assert margin_mode in ('isolated', 'cross'), 'margin_mode should be "isolated" or "cross"'
         sym = self._create_symbol_name(market_type, symbol)
@@ -385,7 +500,7 @@ class OkxTrade(OkxClient, BaseTrade):
                 'instId': sym,
                 'lever': str(lever),
                 'mgnMode': margin_mode,
-                'posSide': ps
+                # 'posSide': ps
             }
             response = self._request_with_params(method='POST',
                                                 request_path='/api/v5/account/set-leverage',
@@ -394,11 +509,15 @@ class OkxTrade(OkxClient, BaseTrade):
                 logger.debug(f'Okx {sym} leverage successfully set to {lever}')
             else:
                 logger.error(f'[LEVERAGE ERROR] Okx {sym}')
+                logger.error(f'{body=}')
                 raise SetLeverageError(f'При изменении плеча на бирже Okx возникла ошибка: {response['msg']}')
         return response
 
     def _position_handler(self, resp, market_type, order_type, ct_val):
-        data = resp['data'][0]
+        try:
+            data = resp['data'][0]
+        except IndexError:
+            return None
 
         token = data['instId']
         syms = token.split('-')
@@ -406,15 +525,21 @@ class OkxTrade(OkxClient, BaseTrade):
 
         leverage = Decimal(data['lever'])
         price = Decimal(data['avgPx'])
-        usdt_amount = Decimal(data['notionalUsd']).normalize()
+
         side = 'buy' if float(data['pos']) > 0 else 'sell'
         qty = abs(Decimal(data['pos']) * ct_val)
-
+        usdt_amount = (qty * price).normalize()
         fee = abs(Decimal(data['fee']))
+
+        realized_pnl = Decimal(data['realizedPnl']).normalize()
+        unrealized_pnl = Decimal(data['uplLastPx']).normalize()
+        curr_position_value = Decimal(data['notionalUsd']).normalize()
 
         return {'exchange': 'okx', 'market_type': market_type, 'order_type': order_type,
                 'token': token, 'leverage': leverage, 'price': price,
-                'usdt_amount': usdt_amount, 'qty': qty, 'order_side': side, 'fee': fee}
+                'usdt_amount': usdt_amount, 'qty': qty, 'order_side': side, 'fee': fee,
+                'realized_pnl': realized_pnl, 'unrealized_pnl': unrealized_pnl,
+                'curr_position_value': curr_position_value}
 
     def _get_position(self, market_type, symbol, order_type, ct_val):
         sym = self._create_symbol_name(market_type, symbol)
@@ -423,12 +548,13 @@ class OkxTrade(OkxClient, BaseTrade):
 
         response = self._request_without_params(method='GET',
                     request_path=path)
+        # return response
         try:
             return self._position_handler(response, market_type, order_type, ct_val)
         except InvalidOperation:
             return None
 
-    def _order_handler(self, resp, market_type, order_type, ct_val):
+    def _order_handler(self, resp, market_type, ct_val):
         data = resp['data'][0]
 
         line = data['instId']
@@ -436,7 +562,11 @@ class OkxTrade(OkxClient, BaseTrade):
         base, quote = syms[0], syms[1]
         token = base + '_' + quote
 
-        price = Decimal(data['avgPx'])
+        status = data['state']
+        order_type = data['ordType']
+
+        price = Decimal(data['fillPx'])
+        limit_price = Decimal(data['px'])
 
         side = data['side']
         qty = Decimal(data['sz']) * ct_val
@@ -444,30 +574,26 @@ class OkxTrade(OkxClient, BaseTrade):
         usdt_amount = (qty * price).normalize()
 
         return {'exchange': 'okx', 'market_type': market_type, 'order_type': order_type,
-                'token': token, 'price': price,
+                'status': status, 'token': token, 'price': price, 'limit_price': limit_price,
                 'usdt_amount': usdt_amount, 'qty': qty, 'order_side': side, 'fee': fee}
 
-    def _get_order(self, symbol, market_type, order_id, order_type, ct_val, **kwargs):
+    def _get_order(self, symbol, market_type, order_id, ct_val, **kwargs):
         sym = self._create_symbol_name(market_type, symbol)
         path = f'/api/v5/trade/order?ordId={order_id}&instId={sym}'
         response = self._request_without_params(method='GET',
                     request_path=path)
         # return response
         try:
-            return self._order_handler(response, market_type, order_type, ct_val)
+            return self._order_handler(response, market_type, ct_val)
         except InvalidOperation:
             return None
 
 
-    # def cancel_order(self, instId, ordId='', clOrdId=''):
-    #     params = {'instId': instId, 'ordId': ordId, 'clOrdId': clOrdId}
-    #     return self._request_with_params('POST', request_path='/api/v5/trade/cancel-order', params=params)
 
     def close_position(self, market_type, symbol, margin_mode, posSide='', ccy='', autoCxl='', clOrdId='', tag=''):
         sym = self._create_symbol_name(market_type, symbol)
         params = {'instId': sym, 'mgnMode': margin_mode, 'posSide': posSide, 'ccy': ccy, 'autoCxl': autoCxl,
                   'clOrdId': clOrdId, 'tag': tag}
-        # print(sym)
         return self._request_with_params('POST', request_path='/api/v5/trade/close-position', params=params)
 
     # def amend_order(self, instId, cxlOnFail='', ordId='', clOrdId='', reqId='', newSz='', newPx='', newTpTriggerPx='',
@@ -510,8 +636,15 @@ class GateTrade(BaseTrade):
         sign = hmac.new(secret.encode('utf-8'), s.encode('utf-8'), hashlib.sha512).hexdigest()
         return {'KEY': key, 'Timestamp': str(t), 'SIGN': sign}
 
-    def _market_order(self, market_type, symbol, side, order_type, qty, ct_val=1,
-                     margin_mode='isolated'):
+    def _place_order(self, market_type,
+                            symbol,
+                            side,
+                            order_type,
+                            qty,
+                            price=None,
+                            stop_loss=None,
+                            ct_val=1,
+                            **kwargs):
         if self.demo:
             if market_type == 'linear':
                 host = "https://fx-api-testnet.gateio.ws"
@@ -531,18 +664,22 @@ class GateTrade(BaseTrade):
         if isinstance(ct_val, Decimal):
             size = size.to_eng_string()
 
-
         symbol = self._create_symbol_name(symbol)
-        body = '{"contract":"' + symbol + '", "size":' + size + ', "price": "0", "tif": "ioc", "close": "false"}'
+        if isinstance(price, Decimal):
+            price = price.normalize().to_eng_string()
+        else:
+            price = str(price) if price else '0'
+        tif = "ioc" if order_type == 'market' else 'gtc'
+        body = '{"contract":"' + symbol + '", "size":' + size + ', "price": "' + price + '", "tif": "' + tif + '", "close": "false"}'
         sign_headers = self.gen_sign('POST', prefix + url, query_param, body)
         headers.update(sign_headers)
 
         response = requests.request('POST', host + prefix + url, headers=headers, data=body)
-        # print(response)
 
         try:
             response = response.json()
         except ValueError:
+            logger.error(f'[ORDER ERROR] Gate {market_type=} {symbol=}')
             return response
 
         order_id = response.get('id')
@@ -552,6 +689,52 @@ class GateTrade(BaseTrade):
             logger.error(f'[ORDER ERROR] Gate {market_type=} {symbol=}')
             raise PlaceOrderError(f'При постановке ордера на бирже Gate возникла ошибка: {response['label']}, {response['message']}')
         return response
+
+    def _place_market_order(self, market_type, symbol, side, qty, ct_val, stop_loss=None, **kwargs):
+        return self._place_order(market_type=market_type,
+                                        symbol=symbol,
+                                        side=side,
+                                        order_type='market',
+                                        qty=qty,
+                                        stop_loss=stop_loss,
+                                        ct_val=ct_val)
+
+    def _place_limit_order(self, market_type, symbol, side, qty, price, ct_val,
+                           stop_loss=None, **kwargs):
+        resp = self._place_order(market_type=market_type,
+                                        symbol=symbol,
+                                        side=side,
+                                        order_type='limit',
+                                        qty=qty,
+                                        price=price,
+                                        stop_loss=stop_loss,
+                                        ct_val=ct_val)
+
+        return resp
+        return resp.get('id', None)
+
+    def _cancel_order(self, market_type, order_id='', **kwargs):
+        if self.demo:
+            if market_type == 'linear':
+                host = "https://fx-api-testnet.gateio.ws"
+        else:
+            if market_type == 'linear':
+                host = "https://api.gateio.ws"
+
+        prefix = "/api/v4"
+        headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+        url = f'/futures/usdt/orders/{order_id}'
+        query_param = ""
+
+        sign_headers = self.gen_sign('DELETE', prefix + url, query_param)
+        headers.update(sign_headers)
+        response = requests.request('DELETE', host + prefix + url + "?" + query_param,
+                                    headers=headers).json()
+        if response.get('status') == 'finished' and response.get('finish_as') == 'cancelled':
+            return response.get('id')
+        else:
+            logger.error(f'[ORDER ERROR] Gate {market_type=}')
+            raise PlaceOrderError(f'При отмене ордера на бирже Gate.io возникла ошибка: {response}')
 
     def _set_leverage(self, market_type, symbol, lever):
         if self.demo:
@@ -571,7 +754,6 @@ class GateTrade(BaseTrade):
         headers.update(sign_headers)
         response = requests.request('POST', host + prefix + url + "?" + query_param,
                                     headers=headers).json()
-        # return response
         if type(response) == dict and response.get('leverage'):
             logger.debug(f'Gate {symbol} leverage successfully set to {lever}')
         elif type(response) == list and response[0].get('leverage'):
@@ -582,7 +764,6 @@ class GateTrade(BaseTrade):
         return response
 
     def _position_handler(self, resp, market_type, order_type, ct_val):
-        # print(resp)
         if type(resp) == list:
             resp = resp[0]
 
@@ -590,15 +771,19 @@ class GateTrade(BaseTrade):
 
         leverage = Decimal(resp['leverage'])
         price = Decimal(resp['entry_price'])
-        usdt_amount = Decimal(resp['value']) - Decimal(resp['unrealised_pnl'])
         side = 'buy' if float(resp['size']) > 0 else 'sell'
         qty = abs(Decimal(resp['size']) * ct_val)
-
+        usdt_amount = Decimal(qty * price)
+        curr_position_value = Decimal(resp['value'])
         fee = abs(Decimal(resp['pnl_fee']))
+        realized_pnl = Decimal(resp['realised_pnl'])
+        unrealized_pnl = Decimal(resp['unrealised_pnl'])
 
         return {'exchange': 'gate', 'market_type': market_type, 'order_type': order_type,
                 'token': token, 'leverage': leverage, 'price': price,
-                'usdt_amount': usdt_amount, 'qty': qty, 'order_side': side, 'fee': fee}
+                'usdt_amount': usdt_amount, 'qty': qty, 'order_side': side, 'fee': fee,
+                'realized_pnl': realized_pnl, 'unrealized_pnl': unrealized_pnl,
+                'curr_position_value': curr_position_value}
         # except TypeError:
         #     print(type(resp), resp)
 
@@ -625,3 +810,19 @@ class GateTrade(BaseTrade):
             return self._position_handler(response, market_type, order_type, ct_val)
         except InvalidOperation:
             return None
+
+    def _order_handler(self, data, market_type, order_type, ct_val):
+        token = data['contract']
+        _id = data['id']
+        status = data['status'].lower()
+        price = Decimal(data['fill_price']) # Цена по которой ордер сматчился
+        limit_price = Decimal(data['price']) # Заявочная цена для лимитного ордера
+        side = 'buy' if float(data['size']) > 0 else 'sell'
+        qty = abs(Decimal(data['size']) * ct_val)
+        usdt_amount = Decimal(qty * price).normalize()
+        fee = (Decimal(data['tkfr']) * usdt_amount).normalize()
+
+        return {'exchange': 'gate', 'market_type': market_type, 'order_type': order_type,
+                'status': status, 'token': token, 'price': price, 'limit_price': limit_price,
+                'usdt_amount': usdt_amount, 'qty': qty, 'order_side': side, 'fee': fee,
+                'id': _id}

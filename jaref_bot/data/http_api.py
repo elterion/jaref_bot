@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 import logging
 from decimal import Decimal
-import random
+import pickle
 
 # Настройка логгирования
 logging.basicConfig(level=logging.INFO,
@@ -16,6 +16,8 @@ logging.getLogger('aiohttp').setLevel('ERROR')
 logging.getLogger('asyncio').setLevel('ERROR')
 logger = logging.getLogger()
 
+with open("./data/coin_information.pkl", "rb") as f:
+    coin_information = pickle.load(f)
 
 class ExchangeRestAPI(ABC):
     interval_dic = {'bybit': {'1m': 1, '5m': 5, '15m': 15, '30m': 30,
@@ -56,11 +58,9 @@ class ExchangeRestAPI(ABC):
     async def get_tickers(self, session):
         pass
 
-    @abstractmethod
     async def _get_candles_params_to_send(self):
         pass
 
-    @abstractmethod
     async def _get_candles_workflow_params(self):
         pass
 
@@ -103,124 +103,22 @@ class ExchangeRestAPI(ABC):
 
         params = self._get_instr_params(symbol)
         r = requests.request('GET', self.BASE_URL + endpoint, params=params).json()
+
+        # return r
         return self._parse_instr_data(r)
 
     async def get_candles(self, session, symbol, interval, n_iters=1, end_date=None):
         assert interval in ('1m', '5m', '15m', '30m', '1h', '4h', '1d'), "possible interval values: '1m', '5m', '15m', '30m', '1h', '4h', '1d'"
 
-        exc = self.EXCHANGE_NAME
-        if self.category == 'spot':
-            endpoint = self.CANDLES_SPOT_ENDPOINT
-        elif self.category == 'linear':
-            endpoint = self.CANDLES_LINEAR_ENDPOINT
-
-        params = self._get_candles_params_to_send()
-        wf_prams = self._get_candles_workflow_params()
-
-        cols = wf_prams['cols']
-        cols_to_drop = wf_prams['cols_to_drop']
-        time_unit = wf_prams['time_unit']
-
-        if exc == 'bybit':
-            params['symbol'] = symbol + 'USDT'
-            params['interval'] = self.interval_dic['bybit'][interval]
-
-        elif exc == 'okx':
-            params['instId'] = symbol + '-USDT'
-            if self.category == 'linear':
-                params['instId'] += '-SWAP'
-            params['interval'] = self.interval_dic['okx'][interval]
-            n_iters *= 10
-        elif exc == 'gate':
-            if self.category == 'spot':
-                params['currency_pair'] = symbol + '_USDT'
-            elif self.category == 'linear':
-                params['contract'] = symbol + '_USDT'
-            params['interval'] = self.interval_dic['gate'][interval]
-            n_iters *= 10
-
-        if end_date is None:
-            end_date = ''
-
-        hist_df = pd.DataFrame(columns=cols)
-
-        try:
-            for _ in range(n_iters):
-                data = await self._send_request(session, endpoint=endpoint, params=params)
-
-                if not data:
-                    logger.warning(f"No data returned for {symbol}.")
-                    break
-
-                if exc == 'bybit':
-                    hist = data['result']['list']
-                    end_date = str(int(hist[-1][0]) - 1)
-                    params['end'] = end_date
-                elif exc == 'okx':
-                    hist = data['data']
-                    end_date = str(int(hist[-1][0]) - 1)
-                    params['after'] = end_date
-                elif exc == 'gate':
-                    hist = data
-
-                    if self.category == 'spot':
-                        end_date = str(int(hist[0][0]) - 1)
-                    elif self.category == 'linear':
-                        end_date = str(int(hist[0]['t']) - 1)
-
-                    params['to'] = end_date
-
-                if exc == 'gate' and self.category == 'linear':
-                    tdf = pd.DataFrame(hist)
-                else:
-                    tdf = pd.DataFrame(hist, columns=cols)
-
-                hist_df = pd.concat([hist_df if not hist_df.empty else None, tdf],
-                    ignore_index=True)
-
-        except KeyError as e:
-            # logger.warning(f'No data for {exc} {self.category}')
-            pass
-        except Exception as e:
-            # logger.error(f"{exc} {self.category}. Error fetching data: {e}")
-            pass
-
-        if cols_to_drop:
-            try:
-                hist_df.drop(cols_to_drop, axis=1, inplace=True)
-            except KeyError:
-                logger.error(f"Error drop columns. {exc=}, {self.category=}")
-                raise KeyError
-
-        if exc == 'gate':
-            hist_df.rename(columns={'o': 'Open', 'v': 'Volume', 't': 'Date',
-                'c': 'Close', 'l': 'Low', 'h': 'High', 'sum': 'Turnover'},
-                inplace=True)
-
-        hist_df[['Open', 'High', 'Low', 'Close', 'Volume', 'Turnover']] = hist_df[
-            ['Open', 'High', 'Low', 'Close', 'Volume', 'Turnover']].astype(float)
-
-        hist_df['Date'] = pd.to_datetime(hist_df['Date'].astype(float), unit=time_unit)
-        hist_df.index = hist_df['Date']
-        hist_df.drop('Date', axis=1, inplace=True)
-        hist_df.index = hist_df.index.tz_localize('UTC').tz_convert('Europe/Moscow')
-        hist_df.sort_index(inplace=True)
-        hist_df['Exchange'] = exc
-        hist_df['Market_type'] = self.category
-
-        if exc == 'okx' and self.category == 'linear':
-            hist_df['Volume'] *= 100
-
-
-        return hist_df[['Open', 'High', 'Low', 'Close', 'Volume',
-                            'Turnover', 'Exchange', 'Market_type']]
-
+        return await self._get_candles(session=session,
+                                       symbol=symbol,
+                                       interval=interval,
+                                       n_iters=n_iters,
+                                       end_date=end_date)
 
 class BybitRestAPI(ExchangeRestAPI):
     EXCHANGE_NAME = 'bybit'
     BASE_URL = "https://api.bybit.com"
-    CANDLES_SPOT_ENDPOINT = '/v5/market/kline'
-    CANDLES_LINEAR_ENDPOINT = '/v5/market/kline'
     INSTR_SPOT_ENDPOINT = "/v5/market/instruments-info"
     INSTR_LINEAR_ENDPOINT = "/v5/market/instruments-info"
     ORDERBOOK_SPOT_ENDPOINT = '/v5/market/orderbook'
@@ -235,9 +133,6 @@ class BybitRestAPI(ExchangeRestAPI):
     def _parse_instr_data(self, data):
         instr_data = {}
         for ticker in data['result']['list']:
-            # if ticker['contractType'] != 'LinearPerpetual':
-            #     continue
-
             if ticker['status'] != 'Trading':
                 logger.warning(f'Bybit {ticker['symbol']} status is {ticker['status']}')
 
@@ -245,14 +140,21 @@ class BybitRestAPI(ExchangeRestAPI):
                 base = ticker['baseCoin']
                 quote = ticker['quoteCoin']
                 min_qty = Decimal(ticker['lotSizeFilter']['minOrderQty'])
+                price_scale = Decimal(ticker['priceScale'])
 
                 if self.category == 'linear':
                     qty_step = Decimal(ticker['lotSizeFilter']['qtyStep'])
-                    instr_data[base+'_'+quote] = {'min_qty': min_qty, 'qty_step': qty_step,
-                                                  'ct_val': 1}
+                    fund_interval = int(ticker['fundingInterval']) // 60
+                    instr_data[base+'_'+quote] = {'min_qty': min_qty,
+                                                  'qty_step': qty_step,
+                                                  'ct_val': 1,
+                                                  'fund_interval': fund_interval,
+                                                  'price_scale': price_scale}
                 elif self.category == 'spot':
                     qty_step = Decimal(ticker['lotSizeFilter']['basePrecision'])
-                    instr_data[base+'_'+quote] = {'min_qty': min_qty, 'qty_step': qty_step}
+                    instr_data[base+'_'+quote] = {'min_qty': min_qty,
+                                                  'qty_step': qty_step,
+                                                  'price_scale': price_scale}
         return instr_data
 
     def _get_orderbook_params(self, symbol, limit):
@@ -268,14 +170,53 @@ class BybitRestAPI(ExchangeRestAPI):
         except KeyError:
             return {}
 
-    def _get_candles_params_to_send(self):
-        return {'category': self.category, 'limit': 1000}
+    async def _get_candles(self, session, symbol, interval, n_iters=1, end_date=None):
+        symbol = self._create_symbol_name(symbol)
+        endpoint = '/v5/market/kline'
+        params = {'category': self.category, 'symbol': symbol, 'limit': 1000,
+                  'interval': self.interval_dic['bybit'][interval]}
+        if end_date is None:
+            end_date = ''
 
-    def _get_candles_workflow_params(self):
         cols = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Turnover']
-        cols_to_drop = []
-        time_unit = 'ms'
-        return {'cols': cols, 'cols_to_drop': cols_to_drop, 'time_unit': time_unit}
+        hist_df = pd.DataFrame(columns=cols)
+
+        try:
+            for _ in range(n_iters):
+                data = await self._send_request(session, endpoint=endpoint, params=params)
+
+                if not data:
+                    logger.warning(f"No data returned for {symbol}.")
+                    break
+
+                hist = data['result']['list']
+                end_date = str(int(hist[-1][0]) - 1)
+                params['end'] = end_date
+
+                tdf = pd.DataFrame(hist, columns=cols)
+                hist_df = pd.concat([hist_df if not hist_df.empty else None, tdf],
+                                    ignore_index=True)
+
+        except KeyError as e:
+            # logger.warning(f'No data for {exc} {self.category}')
+            pass
+        except Exception as e:
+            # logger.error(f"{exc} {self.category}. Error fetching data: {e}")
+            pass
+
+        hist_df[['Open', 'High', 'Low', 'Close', 'Volume', 'Turnover']] = hist_df[
+            ['Open', 'High', 'Low', 'Close', 'Volume', 'Turnover']].astype(float)
+
+        hist_df['Date'] = pd.to_datetime(hist_df['Date'].astype(float), unit='ms')
+        hist_df.index = hist_df['Date']
+        hist_df.drop('Date', axis=1, inplace=True)
+        hist_df.index = hist_df.index.tz_localize('UTC').tz_convert('Europe/Moscow')
+        hist_df.sort_index(inplace=True)
+        hist_df['Exchange'] = 'bybit'
+        hist_df['Market_type'] = self.category
+
+        return hist_df[['Open', 'High', 'Low', 'Close', 'Volume',
+                            'Turnover', 'Exchange', 'Market_type']]
 
     async def get_tickers(self, session):
         endpoint = "/v5/market/tickers"
@@ -308,8 +249,6 @@ class BybitRestAPI(ExchangeRestAPI):
 class OKXRestAPI(ExchangeRestAPI):
     EXCHANGE_NAME = 'okx'
     BASE_URL = 'https://www.okx.com'
-    CANDLES_SPOT_ENDPOINT = '/api/v5/market/history-candles'
-    CANDLES_LINEAR_ENDPOINT = '/api/v5/market/history-candles'
     INSTR_SPOT_ENDPOINT = '/api/v5/public/instruments'
     INSTR_LINEAR_ENDPOINT = '/api/v5/public/instruments'
     ORDERBOOK_SPOT_ENDPOINT = '/api/v5/market/books'
@@ -338,16 +277,23 @@ class OKXRestAPI(ExchangeRestAPI):
                     ct_val = Decimal(ticker['ctVal'])
                     min_qty = Decimal(ticker['minSz']) * ct_val
                     qty_step = Decimal(ticker['lotSz']) * ct_val
+                    price_scale = Decimal(len(ticker['tickSz'].split('.')[-1]))
 
                     instr_data[base+'_'+quote] = {'ct_val': ct_val,
-                                        'min_qty': min_qty, 'qty_step': qty_step}
+                                        'min_qty': min_qty,
+                                        'qty_step': qty_step,
+                                        'price_scale': price_scale}
             elif self.category == 'spot':
                 if ticker['instId'].endswith('USDT'):
                     base = ticker['baseCcy']
                     quote = ticker['quoteCcy']
                     min_qty = Decimal(ticker['minSz'])
                     qty_step = Decimal(ticker['lotSz'])
-                    instr_data[base+'_'+quote] = {'min_qty': min_qty, 'qty_step': qty_step}
+                    price_scale = Decimal(len(ticker['tickSz'].split('.')[-1]))
+
+                    instr_data[base+'_'+quote] = {'min_qty': min_qty,
+                                                  'qty_step': qty_step,
+                                                  'price_scale': price_scale}
         return instr_data
 
     def _get_orderbook_params(self, symbol, limit):
@@ -363,15 +309,69 @@ class OKXRestAPI(ExchangeRestAPI):
         except KeyError:
             return {}
 
-    def _get_candles_params_to_send(self):
-        return {}
+    async def get_candles(self, session, symbol, interval, n_iters=1, end_date=None):
+        symbol = self._create_symbol_name(symbol=symbol, market_type=self.category)
+        endpoint = '/api/v5/market/history-candles'
 
-    def _get_candles_workflow_params(self):
         cols = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', '0', 'Turnover', '1']
         cols_to_drop = ['0', '1']
-        time_unit = 'ms'
-        return {'cols': cols, 'cols_to_drop': cols_to_drop, 'time_unit': time_unit}
 
+        params = {'instId': symbol,
+                  'bar': self.interval_dic['okx'][interval]}
+        n_iters *= 10
+
+        if end_date is None:
+            end_date = ''
+
+        hist_df = pd.DataFrame(columns=cols)
+        try:
+            for _ in range(n_iters):
+                data = await self._send_request(session, endpoint=endpoint, params=params)
+
+                if not data:
+                    logger.warning(f"No data returned for {symbol}.")
+                    break
+
+                hist = data['data']
+                end_date = str(int(hist[-1][0]) - 1)
+                params['after'] = end_date
+
+                tdf = pd.DataFrame(hist, columns=cols)
+                hist_df = pd.concat([hist_df if not hist_df.empty else None, tdf],
+                    ignore_index=True)
+
+        except KeyError as e:
+            # logger.warning(f'No data for {exc} {self.category}')
+            pass
+        except Exception as e:
+            # logger.error(f"{exc} {self.category}. Error fetching data: {e}")
+            pass
+
+        if cols_to_drop:
+            try:
+                hist_df.drop(cols_to_drop, axis=1, inplace=True)
+            except KeyError:
+                logger.error(f"Error drop columns. OKX, {self.category=}")
+                raise KeyError
+
+        hist_df[['Open', 'High', 'Low', 'Close', 'Volume', 'Turnover']] = hist_df[
+            ['Open', 'High', 'Low', 'Close', 'Volume', 'Turnover']].astype(float)
+
+        hist_df['Date'] = pd.to_datetime(hist_df['Date'].astype(float), unit='ms')
+        hist_df.index = hist_df['Date']
+        hist_df.drop('Date', axis=1, inplace=True)
+        hist_df.index = hist_df.index.tz_localize('UTC').tz_convert('Europe/Moscow')
+        hist_df.sort_index(inplace=True)
+        hist_df['Exchange'] = 'okx'
+        hist_df['Market_type'] = self.category
+
+        if self.category == 'linear':
+            sym = symbol.split('-')
+            ct_val = coin_information['okx_linear'][sym[0] + '_' + sym[1]]['ct_val']
+            hist_df['Volume'] *= float(ct_val)
+
+        return hist_df[['Open', 'High', 'Low', 'Close', 'Volume',
+                            'Turnover', 'Exchange', 'Market_type']]
 
     async def get_tickers(self, session):
         category = self.category.upper() if self.category =='spot' else 'SWAP'
@@ -397,8 +397,6 @@ class OKXRestAPI(ExchangeRestAPI):
 class GateIORestAPI(ExchangeRestAPI):
     EXCHANGE_NAME = 'gate'
     BASE_URL = 'https://api.gateio.ws'
-    CANDLES_SPOT_ENDPOINT = '/api/v4/spot/candlesticks'
-    CANDLES_LINEAR_ENDPOINT = '/api/v4/futures/usdt/candlesticks'
     INSTR_SPOT_ENDPOINT = '/api/v4/spot/currency_pairs'
     INSTR_LINEAR_ENDPOINT = '/api/v4/futures/usdt/contracts'
     ORDERBOOK_SPOT_ENDPOINT = '/api/v4/spot/order_book'
@@ -421,7 +419,10 @@ class GateIORestAPI(ExchangeRestAPI):
 
                     prec = int(ticker['amount_precision'])
                     qty_step = round(1 / (10 ** prec), prec)
-                    instr_data[base+'_'+quote] = {'min_qty': min_qty, 'qty_step': qty_step}
+                    price_scale = Decimal(len(ticker['order_price_round'].split('.')[-1]))
+                    instr_data[base+'_'+quote] = {'min_qty': min_qty,
+                                                  'qty_step': qty_step,
+                                                  'price_scale': price_scale}
             elif self.category == 'linear':
                 if ticker['name'].endswith('USDT'):
                     base = ticker['name'].split('_')[0]
@@ -429,12 +430,20 @@ class GateIORestAPI(ExchangeRestAPI):
                     ct_val = Decimal(ticker['quanto_multiplier'])
                     min_qty = Decimal(ticker['order_size_min']) * ct_val
                     qty_step = Decimal(ticker['order_size_min']) * ct_val
+                    fund_interval = ticker.get('funding_interval', 0) // 3600
+                    next_fund_time = ticker.get('funding_next_apply', 0)
+                    nft = datetime.fromtimestamp(next_fund_time).strftime('%Y-%m-%d %H:%M')
+                    price_scale = Decimal(len(ticker['order_price_round'].split('.')[-1]))
 
                     if ticker['in_delisting']:
                         logger.warning(f'Coin {ticker['name']} in delisting on Gate.io!')
 
-                    instr_data[base+'_'+quote] = {'min_qty': min_qty, 'qty_step': qty_step,
-                                                  'ct_val': ct_val}
+                    instr_data[base+'_'+quote] = {'min_qty': min_qty,
+                                                  'qty_step': qty_step,
+                                                  'ct_val': ct_val,
+                                                  'fund_interval': fund_interval,
+                                                  'next_fund_time': nft,
+                                                  'price_scale': price_scale}
         return instr_data
 
     def _get_orderbook_params(self, symbol, limit):
@@ -459,20 +468,84 @@ class GateIORestAPI(ExchangeRestAPI):
         except KeyError:
             return {}
 
+    async def get_candles(self, session, symbol, interval, n_iters=1, end_date=None):
+        params = {'Accept': 'application/json', 'Content-Type': 'application/json'}
 
-    def _get_candles_params_to_send(self):
-        return {'Accept': 'application/json', 'Content-Type': 'application/json'}
-
-    def _get_candles_workflow_params(self):
         if self.category == 'spot':
+            endpoint = '/api/v4/spot/candlesticks'
             cols = ['Date', 'Volume', 'Close', 'High', 'Low', 'Open', 'Turnover', '0']
             cols_to_drop = ['0']
+            params['currency_pair'] = symbol
         elif self.category == 'linear':
+            endpoint = '/api/v4/futures/usdt/candlesticks'
             cols = ['Date', 'Volume', 'Close', 'High', 'Low', 'Open', 'Turnover']
             cols_to_drop = []
-        time_unit = 's'
-        return {'cols': cols, 'cols_to_drop': cols_to_drop, 'time_unit': time_unit}
+            params['contract'] = symbol
 
+        params['interval'] = self.interval_dic['gate'][interval]
+        n_iters *= 10
+
+        if end_date is None:
+            end_date = ''
+
+        hist_df = pd.DataFrame(columns=cols)
+
+        try:
+            for _ in range(n_iters):
+                hist = await self._send_request(session, endpoint=endpoint, params=params)
+
+                if not hist:
+                    logger.warning(f"No data returned for {symbol}.")
+                    break
+
+                if self.category == 'spot':
+                    end_date = str(int(hist[0][0]) - 1)
+                elif self.category == 'linear':
+                    end_date = str(int(hist[0]['t']) - 1)
+
+                params['to'] = end_date
+
+                if self.category == 'linear':
+                    tdf = pd.DataFrame(hist)
+
+                hist_df = pd.concat([hist_df if not hist_df.empty else None, tdf],
+                    ignore_index=True)
+
+        except KeyError as e:
+            # logger.warning(f'No data for {exc} {self.category}')
+            pass
+        except Exception as e:
+            # logger.error(f"{exc} {self.category}. Error fetching data: {e}")
+            pass
+
+        if cols_to_drop:
+            try:
+                hist_df.drop(cols_to_drop, axis=1, inplace=True)
+            except KeyError:
+                logger.error(f"Error drop columns. Gate.io, {self.category=}")
+                raise KeyError
+
+        hist_df.rename(columns={'o': 'Open', 'v': 'Volume', 't': 'Date',
+            'c': 'Close', 'l': 'Low', 'h': 'High', 'sum': 'Turnover'},
+            inplace=True)
+
+        hist_df[['Open', 'High', 'Low', 'Close', 'Volume', 'Turnover']] = hist_df[
+            ['Open', 'High', 'Low', 'Close', 'Volume', 'Turnover']].astype(float)
+
+        hist_df['Date'] = pd.to_datetime(hist_df['Date'].astype(float), unit='s')
+        hist_df.index = hist_df['Date']
+        hist_df.drop('Date', axis=1, inplace=True)
+        hist_df.index = hist_df.index.tz_localize('UTC').tz_convert('Europe/Moscow')
+        hist_df.sort_index(inplace=True)
+        hist_df['Exchange'] = 'gate'
+        hist_df['Market_type'] = self.category
+
+        if self.category == 'linear':
+            ct_val = coin_information['gate_linear'][symbol]['ct_val']
+            hist_df['Volume'] *= float(ct_val)
+
+        return hist_df[['Open', 'High', 'Low', 'Close', 'Volume',
+                            'Turnover', 'Exchange', 'Market_type']]
 
     async def get_tickers(self, session):
         if self.category == 'spot':
@@ -508,7 +581,6 @@ class GateIORestAPI(ExchangeRestAPI):
                     except ValueError:
                         continue
         return exchange_rates
-
 
 
 class ExchangeManager:

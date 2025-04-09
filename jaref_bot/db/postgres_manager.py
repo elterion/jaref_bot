@@ -2,6 +2,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.errors import UniqueViolation, UndefinedColumn
 import pandas as pd
+import polars as pl
 from datetime import datetime, timezone, timedelta
 
 import io
@@ -20,19 +21,43 @@ class DBManager:
         with self.conn.cursor() as cursor:
             cursor.execute(query, (bucket, exchange, market_type, token, avg_bid, avg_ask))
 
+    def update_funding_data(self, records):
+        """
+        Обновление данных фандинга. Если запись с таким же (token, exchange)
+        уже существует, она будет заменена новыми данными.
+
+        :param records: список кортежей, где каждый кортеж имеет вид:
+                        (token, exchange, ask_price, bid_price, funding_rate, fund_interval, next_fund_time)
+        """
+        sql = """
+        INSERT INTO funding_data (token, exchange, ask_price, bid_price, funding_rate, fund_interval, next_fund_time)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (token, exchange) DO UPDATE SET
+            ask_price = EXCLUDED.ask_price,
+            bid_price = EXCLUDED.bid_price,
+            funding_rate = EXCLUDED.funding_rate,
+            fund_interval = EXCLUDED.fund_interval,
+            next_fund_time = EXCLUDED.next_fund_time;
+        """
+        if isinstance(records, pl.DataFrame):
+            records = records.rows()
+
+        with self.conn.cursor() as cursor:
+            cursor.executemany(sql, records)
+
     def place_order(self, token, exchange, market_type, order_type, order_side,
-                  qty, price, usdt_amount, usdt_fee, leverage, created_at=None):
+                  qty, price, usdt_amount, realized_pnl, leverage, created_at=None):
         """Добавляет новый ордер в таблицу current_orders"""
         query = """
         INSERT INTO current_orders (token, exchange, market_type, order_type,
-        order_side, qty, price, usdt_amount, usdt_fee, leverage, created_at)
+        order_side, qty, price, usdt_amount, realized_pnl, leverage, created_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (token, exchange, market_type)
         DO UPDATE SET
             qty = EXCLUDED.qty,
             price = EXCLUDED.price,
             usdt_amount = EXCLUDED.usdt_amount,
-            usdt_fee = EXCLUDED.usdt_fee;
+            realized_pnl = EXCLUDED.realized_pnl;
         """
 
         # Если created_at не передан, используем текущее время
@@ -43,7 +68,7 @@ class DBManager:
         try:
             with self.conn.cursor() as cursor:
                 cursor.execute(query, (token, exchange, market_type, order_type,
-                    order_side, qty, price, usdt_amount, usdt_fee, leverage, created_at))
+                    order_side, qty, price, usdt_amount, realized_pnl, leverage, created_at))
         except psycopg.IntegrityError as e:
             self.conn.rollback()
             raise UniqueViolation(f"Order '{token}' on {exchange}.{market_type} already exists.")
@@ -100,7 +125,7 @@ class DBManager:
                 'open_price': order_record[5],
                 'open_usdt_amount': order_record[6],
                 'qty_current': order_record[7],
-                'open_fee': order_record[8],
+                'realized_pnl': order_record[8],
                 'leverage': order_record[9],
                 'created_at': order_record[10]
             }
@@ -252,10 +277,46 @@ class DBManager:
                 cstd = EXCLUDED.cstd
         """
 
+        if isinstance(df, pl.DataFrame):
+            df = df.to_pandas()
+
         with self.conn.cursor() as cursor:
             # Преобразуем DataFrame в список кортежей
             data = [
                 (row.token, row.long_exc, row.short_exc, row.mean, row.std, row.cmean, row.cstd)
+                for row in df.itertuples()
+            ]
+            try:
+                cursor.executemany(query, data)
+            except Exception as e:
+                print(f"Error updating stats: {e}")
+                self.conn.rollback()
+                raise
+
+    def copy_data_from_redis(self, df):
+        """Записывает данные в таблицу market_data по ключу
+        (exchange, market_type, token, timestamp)"""
+        query = """
+            INSERT INTO market_data (exchange, market_type, token, timestamp, ask_price, bid_price)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (exchange, market_type, token, timestamp)
+            DO UPDATE SET
+                exchange = EXCLUDED.exchange,
+                market_type = EXCLUDED.market_type,
+                token = EXCLUDED.token,
+                timestamp = EXCLUDED.timestamp
+        """
+
+        if isinstance(df, pl.DataFrame):
+            df = df.to_pandas()
+
+        Moscow_TZ = timezone(timedelta(hours=3))
+        created_at = datetime.now(Moscow_TZ).strftime('%Y-%m-%d %H:%M:%S')
+
+        with self.conn.cursor() as cursor:
+            # Преобразуем DataFrame в список кортежей
+            data = [
+                (row.exchange, 'linear', row.token, created_at, row.ask, row.bid)
                 for row in df.itertuples()
             ]
             try:

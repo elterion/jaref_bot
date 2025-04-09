@@ -1,9 +1,10 @@
-import orjson
+import json
 import hmac
 import time
 import logging
 import base64
 import pickle
+import redis
 
 from jaref_bot.core.exchange.base_websocket import BaseWebSocketClient
 from jaref_bot.config import credentials as cr
@@ -48,7 +49,7 @@ class OkxWebSocketClient(BaseWebSocketClient):
                 'timestamp': ts,
                 'sign': signature}
         auth_msg = {"op": "login", "args": [args]}
-        await self.connections[stream_type].send(orjson.dumps(auth_msg))
+        await self.connections[stream_type].send(json.dumps(auth_msg))
         logger.debug(f"Sent authentication request to Okx ({stream_type})")
 
     async def default_handler(self, stream_type, msg):
@@ -59,28 +60,27 @@ class OkxWebSocketClient(BaseWebSocketClient):
         if event == 'login' and status == '0':
             logger.info(f'Connected to OKX')
         elif event in ('channel-conn-count', 'channel-conn-count-error'):
-            # logger.info(f'Connected to OKX')
-            print(msg)
+            logger.info(f'OKX n_connections: {msg.get('connCount', 0)}')
         elif event == 'subscribe' and msg.get('connId'):
             self.connected = True
             if not self.subscription_confirmation:
                 logger.info(f'Subscribed to OKX.{stream_type}')
                 self.subscription_confirmation = True
-        elif event == 'subscribe':
+        elif event == 'subscribe': # В случае, если при подписке произошла ошибка
             print(msg)
-        elif channel == 'orders' and msg['data'][0]['state'] in ('filled', 'partially_filled'):
+        elif channel == 'orders':
             await self.handle_order_stream(stream_type, msg)
-        elif channel == 'orders' and msg['data'][0]['state'] == 'live':
-            pass
         elif stream_type == 'orderbook':
             await self.handle_orderbook_stream(msg)
         else:
             print(f'okx default handler: {msg}')
 
     async def handle_order_stream(self, stream_type, msg):
+        redis_client = redis.Redis(db=self.DB_NUM['orders'], decode_responses=True)
         data = msg['data'][0]
 
         order_id = data['ordId']
+        status = data['state']
         symbol = data['instId'].split('-')[0] + '_USDT'
         qty = float(data['sz'])
 
@@ -91,14 +91,29 @@ class OkxWebSocketClient(BaseWebSocketClient):
             qty *= ct_val
 
         side = data['side'].lower()
-        usdt_fee = abs(float(data['fillFee'] or data['fee'] or 0))
 
+        if status == 'live':
+            price = float(data['px'])
+            print(f'[ORDER PLACED] {side} {qty} {symbol} at {price}')
+            redis_client.hset(name=f'pending_orders:bybit:{symbol}',
+                              mapping={'qty': qty, 'side': side})
+        elif status == 'canceled':
+            price = float(data['px'])
+            print(f'[ORDER CANCELLED] {side} {qty} {symbol} at {price}')
+            redis_client.delete(f'pending_orders:bybit:{symbol}')
+        elif status == 'filled':
+            price = float(data['fillPx'])
+            usdt_fee = abs(float(data['fillFee']))
+            print(f'[ORDER FILLED] {side} {qty} {symbol} for {usdt_value}')
+        else:
+            print(data)
 
-        price = float(data['avgPx'] or data['px'] or 0)
-        usdt_value = float(data['fillNotionalUsd'] or data['notionalUsd'] or 0)
+            price = float(data['avgPx'] or data['px'] or 0)
+            usdt_value = float(data['fillNotionalUsd'] or data['notionalUsd'] or 0)
 
-        if usdt_fee < 0.00001:
-            fee = float(market_fees[f'gate_{market_type}']) * usdt_value
+            usdt_fee = abs(float(data['fillFee'] or data['fee'] or 0))
+            if usdt_fee < 0.00001:
+                fee = float(market_fees[f'okx_{market_type}']) * usdt_value
 
     async def handle_orderbook_stream(self, msg):
         data = msg.get('data', [])
@@ -132,7 +147,7 @@ class OkxWebSocketClient(BaseWebSocketClient):
             {"channel": "orders", "instType": "SPOT"},
             {"channel": "orders", "instType": "SWAP"}
             ]}
-        await self._subscribe(stream_type='private', channel='order', sub_msg=sub_msg)
+        await self.subscribe(endpoint='private', sub_msg=sub_msg)
 
     async def subscribe_orderbook_stream(self, depth, tickers):
         okx_tokens = list(self.coin_info['okx_linear'].keys())

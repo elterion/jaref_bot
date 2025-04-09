@@ -2,6 +2,7 @@ import orjson
 import hmac
 import time
 import logging
+import redis
 
 from jaref_bot.core.exchange.base_websocket import BaseWebSocketClient
 from jaref_bot.config import credentials as cr
@@ -36,7 +37,6 @@ class BybitWebSocketClient(BaseWebSocketClient):
     async def default_handler(self, stream_type, msg):
         event = msg.get('op')
         status = msg.get('success')
-        # print(f'{msg=}')
 
         if event == 'auth' and status:
             logger.info(f'Connected to ByBit')
@@ -98,29 +98,51 @@ class BybitWebSocketClient(BaseWebSocketClient):
         pipe.execute();
 
     async def handle_order_stream(self, stream_type, msg):
+        redis_client = redis.Redis(db=self.DB_NUM['orders'], decode_responses=True)
+
         data = msg['data'][0]
 
         order_id = data['orderId']
         symbol = data['symbol'][:-4] + '_USDT'
+        status = data['orderStatus'].lower()
 
         market_type = data['category'].lower()
         side = data['side'].lower()
-        qty = data['cumExecQty']
-        price = float(data['avgPrice'])
-        usdt_value = float(data['cumExecValue'])
-        usdt_fee = abs(float(data['cumExecFee']))
+
+        if status == 'new':
+            qty = data['qty']
+            price = data['price']
+            print(f'[ORDER PLACED] {side} {qty} {symbol} at {price}')
+            redis_client.hset(name=f'pending_orders:bybit:{symbol}',
+                              mapping={'qty': qty, 'side': side})
+
+        elif status == 'filled':
+            qty = data['cumExecQty']
+
+            price = float(data['avgPrice'])
+            usdt_value = float(data['cumExecValue'])
+            usdt_fee = abs(float(data['cumExecFee']))
+
+            print(f'[ORDER FILLED] {side} {qty} {symbol} for {usdt_value}')
+        elif status == 'cancelled':
+            qty = data['qty']
+            price = data['price']
+            print(f'[ORDER CANCELLED] {side} {qty} {symbol} at {price}')
+            redis_client.delete(f'pending_orders:bybit:{symbol}')
+        else:
+            print(data)
 
     async def subscribe_position_stream(self):
         sub_msg = {"op": "subscribe", "args": ['position']}
-        await self.subscribe(endpoint='private', channel='position', sub_msg=sub_msg)
+        await self.subscribe(endpoint='private', sub_msg=sub_msg)
 
     async def subscribe_order_stream(self):
         sub_msg = {"op": "subscribe", "args": ['order']}
-        await self.subscribe(endpoint='private', channel='order', sub_msg=sub_msg)
+        await self.subscribe(endpoint='private', sub_msg=sub_msg)
 
     async def subscribe_ticker_stream(self, ticker):
         sub_msg = {"op": "subscribe", "args": [f'tickers.{ticker}']}
-        await self.subscribe(endpoint='linear', channel='ticker', sub_msg=sub_msg)
+        await self.subscribe(endpoint='linear', sub_msg=sub_msg)
 
     async def subscribe_orderbook_stream(self, depth, tickers):
         bybit_tokens = list(self.coin_info['bybit_linear'].keys())
@@ -133,5 +155,4 @@ class BybitWebSocketClient(BaseWebSocketClient):
             args.append(f'orderbook.{depth}.{sym}')
 
         sub_msg = {"op": "subscribe", "args": args}
-        # print(sub_msg)
         await self.subscribe(endpoint='linear', sub_msg=sub_msg)

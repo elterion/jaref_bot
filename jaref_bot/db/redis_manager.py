@@ -65,17 +65,22 @@ def get_exchanges(redis_client: redis.Redis) -> list:
     return orjson.loads(data)
 
 class RedisManager():
-    def __init__(self):
-        self.redis_client = redis.Redis(db=0, decode_responses=True)
+    db_num = {'orderbooks': 0, 'prices': 1, 'orders': 2}
+
+    def __init__(self, db_name):
+        assert db_name in ('orderbooks', 'prices', 'orders'), "db_name should be in ('orderbooks', 'prices', 'orders')"
+        self.db_name = db_name
+        self.redis_client = redis.Redis(db=self.db_num[db_name], decode_responses=True)
 
     def get_orderbooks(self, n_levels):
+        assert self.db_name == 'orderbooks', 'Переключитесь на orderbooks таблицу!'
+
         sides = ['bid', 'ask']
         orderbook_data = []
         cursor = 0
         pattern = 'orderbook:*:*:*:update_time'
 
         while True:
-            # Получаем пачку ключей
             cursor, keys = self.redis_client.scan(cursor, pattern, count=10_000)
             if not keys:
                 if cursor == 0:
@@ -83,7 +88,6 @@ class RedisManager():
                 continue
 
             pipeline = self.redis_client.pipeline()
-            # Для каждого ключа запланировать получение времени обновления и ордербуков
             for key in keys:
                 pipeline.hget(key, 'cts')
                 parts = key.split(':')
@@ -93,8 +97,6 @@ class RedisManager():
                     pipeline.hgetall(orderbook_key)
             results = pipeline.execute()
 
-            # Для каждого ключа обработать результаты.
-            # Каждый ключ генерирует (1 + len(sides)) результатов.
             chunk_size = 1 + len(sides)
             for i, key in enumerate(keys):
                 base_index = i * chunk_size
@@ -134,3 +136,37 @@ class RedisManager():
 
         return pl.DataFrame(orderbook_data).with_columns(
                 pl.col("update_time").str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S"))
+
+
+    def add_order(self, exchange, token, qty, side, ts, purpose):
+        assert self.db_name == 'orders', 'Переключитесь на orders таблицу!'
+        self.redis_client.hset(name=f'pending_orders:{exchange}:{token}',
+                               mapping={'qty': qty, 'side': side, 'ts': ts, 'purpose': purpose})
+
+    def delete_order(self, exchange, token):
+        assert self.db_name == 'orders', 'Переключитесь на orders таблицу!'
+        self.redis_client.delete(f'pending_orders:{exchange}:{token}')
+
+
+    def get_pending_orders(self):
+        assert self.db_name == 'orders', 'Переключитесь на orders таблицу!'
+        orders = {}
+
+        for key in self.redis_client.scan_iter("pending_orders:*"):
+            # Ключ имеет вид "pending_orders:{exchange}:{token}"
+            try:
+                _, exchange, token = key.split(":")
+            except ValueError:
+                # Если формат ключа не соответствует ожидаемому, пропускаем его
+                continue
+
+            # Получаем все поля хэша для данного ключа (данные уже в виде строк)
+            order_data = self.redis_client.hgetall(key)
+            orders.setdefault(exchange, {})[token] = order_data
+
+        return orders
+
+    def clear_orders_table(self):
+        assert self.db_name == 'orders', 'Переключитесь на orders таблицу!'
+
+        self.redis_client.flushdb()
