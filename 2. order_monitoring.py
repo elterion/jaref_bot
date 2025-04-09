@@ -76,11 +76,15 @@ if __name__ == '__main__':
 
                 usdt = round(max(long_price, short_price) * qty, 2)
 
+                # print(f'{long_price=}; {short_price=}')
+                if long_price > short_price:
+                    break
+
                 t.add_row([token, long_exc, short_exc, qty, usdt, mean,
                            std, diff, dev, lm_profit, sm_profit, profit])
 
             print(t)
-            sleep(1)
+            sleep(1.0)
         except KeyError:
             print(f"Восстанавливаем соединение...")
             sleep(5)
