@@ -1,0 +1,13 @@
+strong,
+b {
+    font-weight: bold;
+    color: var(--color-primary);
+}
+
+.positive {
+    color: #66FF00;
+}
+
+.negative {
+    color: #FF0000;
+}
