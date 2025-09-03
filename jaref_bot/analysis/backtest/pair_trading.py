@@ -1,7 +1,7 @@
 import polars as pl
+import polars_ols as pls
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from sklearn.preprocessing import StandardScaler
 import numpy as np
 from numba import njit
 from numba.typed import List as NumbaList
@@ -31,105 +31,7 @@ except Exception:
     # Если IPython не установлен — значит точно CLI
     from tqdm import tqdm
 
-def make_trunc_df(df, timeframe, token_1, token_2, start_date=None, end_date=None, method="last"):
-    df = df.with_columns(
-            ((pl.col(f'{token_1}_bid_price') + pl.col(f'{token_1}_ask_price')) / 2).alias(token_1),
-            ((pl.col(f'{token_2}_bid_price') + pl.col(f'{token_2}_ask_price')) / 2).alias(token_2),
-        ).select('time', 'ts', token_1, token_2, 'spread')
 
-    # условия агрегации
-    if method == "last":
-        agg_exprs = [
-            pl.col("ts").last(),
-            pl.col(token_1).last().alias(token_1),
-            pl.col(token_2).last().alias(token_2),
-            pl.col("spread").last().alias("spread"),
-        ]
-    elif method == "triple":
-        agg_exprs = [
-            pl.col("ts").last(),
-            ((pl.col(token_1).last() + pl.col(token_1).max() + pl.col(token_1).min()) / 3).alias(token_1),
-            ((pl.col(token_2).last() + pl.col(token_2).max() + pl.col(token_2).min()) / 3).alias(token_2),
-            ((pl.col("spread").last() + pl.col("spread").max() + pl.col("spread").min()) / 3).alias("spread"),
-        ]
-    else:
-        raise ValueError(f"Unknown method: {method}")
-
-    df = df.group_by_dynamic(
-                index_column="time",
-                every=timeframe,
-                label='right'
-            ).agg(agg_exprs)
-    if start_date:
-        df = df.filter(pl.col('time') > start_date)
-    if end_date:
-        df = df.filter(pl.col('time') < end_date)
-
-    return df
-
-def make_df_from_orderbooks(df_1, df_2, token_1, token_2, start_time=None, end_time=None, log_=True):
-    """
-    Функция на вход принимает 2 датафрейма с ордербуками, усредняет цены покупки/продажи
-    и возвращает новый датафрейм с рассчитанным спредом.
-
-    """
-
-    date_col = 'bucket' if 'bucket' in df_1.columns else 'time'
-
-    if start_time is None:
-        start_time = df_1[date_col].min()
-    if end_time is None:
-        end_time = df_1[date_col].max()
-
-    df = df_1.drop('exchange', 'market_type', 'token'
-        ).rename(
-            {'bid_price': f'{token_1}_bid_price', 'bid_size': f'{token_1}_bid_size',
-             'ask_price': f'{token_1}_ask_price', 'ask_size': f'{token_1}_ask_size'}
-        ).join(df_2.drop('exchange', 'market_type', 'token'),
-            on=date_col, how='full', coalesce=True, suffix='_r'
-        ).sort(by=date_col
-        ).rename(
-            {'bid_price': f'{token_2}_bid_price', 'bid_size': f'{token_2}_bid_size',
-             'ask_price': f'{token_2}_ask_price', 'ask_size': f'{token_2}_ask_size'}
-        ).fill_null(strategy='forward'
-        ).filter(
-            (pl.col(date_col) > start_time) & (pl.col(date_col) < end_time)
-        ).with_columns(
-            pl.col(date_col).dt.epoch('s').alias('ts'),
-            ((pl.col(f'{token_1}_bid_price') + pl.col(f'{token_1}_ask_price')) / 2).alias(token_1),
-            ((pl.col(f'{token_2}_bid_price') + pl.col(f'{token_2}_ask_price')) / 2).alias(token_2),
-        )
-
-    if log_:
-        df = df.with_columns(
-            (pl.col(token_1).log() - pl.col(token_2).log()).alias('spread')
-        )
-    else:
-        df = df.with_columns(
-            (pl.col(token_1) - pl.col(token_2)).alias('spread')
-        )
-
-    return df
-
-def make_spread_df(df, token_1, token_2, wind):
-    return df.lazy().with_columns(
-                pl.col('spread').rolling_mean(wind).alias(f'mean'),
-                pl.col('spread').rolling_std(wind, ddof=1).alias(f'std')
-            ).with_columns(
-                ((pl.col('spread') - pl.col('mean')) / pl.col('std')).alias(f'z_score')
-            ).collect()
-
-def make_spread_df_bulk(df, token_1, token_2, winds):
-    exprs = []
-
-    for wind in winds:
-        mean_col = pl.col('spread').rolling_mean(wind).alias(f'mean_{wind}')
-        std_col = pl.col('spread').rolling_std(wind).alias(f'std_{wind}')
-        z_score_col = ((pl.col('spread') - mean_col) / std_col).alias(f'z_score_{wind}')
-
-        exprs.extend([mean_col, std_col, z_score_col])
-
-    return df.lazy().with_columns(exprs).collect()
 
 @njit("float64(float64, float64)", fastmath=True, cache=True)
 def _round(value, dp):
