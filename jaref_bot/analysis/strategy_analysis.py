@@ -2,6 +2,19 @@ import polars as pl
 import numpy as np
 from datetime import datetime, timedelta
 
+def get_duration_string(dur: int):
+    if dur < 60:
+        return f'{dur} seconds'
+    elif dur < 3600:
+        mins = dur // 60
+        secs = dur - mins * 60
+        return f'{mins} minutes {secs} seconds'
+    elif dur < 3600 * 24:
+        hours = dur // 3600
+        mins = (dur - hours * 3600) // 60
+        secs = dur - hours * 3600 - 60 * mins
+        return f'{hours} hours {mins} minutes {secs} seconds'
+
 def analyze_strategy(df: pl.DataFrame, start_date, end_date,
                      initial_balance: float = 1000.0) -> dict:
     """
@@ -39,9 +52,13 @@ def analyze_strategy(df: pl.DataFrame, start_date, end_date,
     # --- Рассчитываем длительности сделок ---
     df = df.with_columns((pl.col("close_ts") - pl.col("open_ts")).alias('duration'))
 
-    metrics["duration_min"] = int(df['duration'].min())
-    metrics["duration_max"] = int(df['duration'].max())
-    metrics["duration_avg"] = int(df['duration'].mean())
+    min_dur = int(df['duration'].min())
+    max_dur = int(df['duration'].max())
+    avg_dur = int(df['duration'].mean())
+
+    metrics["duration_min"] = get_duration_string(min_dur)
+    metrics["duration_max"] = get_duration_string(max_dur)
+    metrics["duration_avg"] = get_duration_string(avg_dur)
     metrics['time_in_trade'] = round(df['duration'].sum() / total_seconds, 2)
 
     # --- Проверяем наличие стоп-лоссов и ликвидаций ---
@@ -83,20 +100,20 @@ def analyze_strategy(df: pl.DataFrame, start_date, end_date,
         pl.col("balance").cum_max().alias("cum_max")
     )
     df = df.with_columns(
-        (pl.col("balance") / pl.col("cum_max") - 1).alias("drawdown")
+        (pl.col("balance") - pl.col("cum_max")).alias("drawdown") # В абсолютных величинах
     )
 
-    metrics['max_drawdown'] = round(df.select(pl.col("drawdown")).min().item() * 100, 2)
+    metrics['max_drawdown'] = round(
+        df.select("drawdown",'cum_profit').min_horizontal().min(),
+        2)
 
     # --- Информация по сделкам ---
     metrics['max_profit'] = round(df['total_profit'].max(), 2)
     metrics['max_loss'] = round(min(df['total_profit'].min(), 0), 2)
     metrics['avg_profit'] = round(df['total_profit'].mean(), 2)
 
-    try:
-        profit_ratio = round(metrics['avg_profit'] / abs(metrics['max_drawdown']), 3)
-    except ZeroDivisionError:
-        profit_ratio = round(metrics['avg_profit'] / 0.015, 3)
+
+    profit_ratio = round(df['total_profit'].sum() / (abs(metrics['max_drawdown']) + 1), 3)
 
     metrics['profit_ratio'] = profit_ratio
 
