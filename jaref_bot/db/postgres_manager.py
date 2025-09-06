@@ -210,6 +210,26 @@ class DBManager:
             self.conn.rollback()
             raise UniqueViolation(f"Order '{token}' on {exchange}.{market_type} already exists.")
 
+    def add_pair_order(self, token_1, token_2, side, qty_1, qty_2):
+        """Добавляет новый ордер в таблицу pairs"""
+        query = """
+        INSERT INTO pairs (token_1, token_2, side, qty_1, qty_2)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (token_1, token_2)
+        DO NOTHING
+        """
+
+        with self.conn.cursor() as cursor:
+            cursor.execute(query, (token_1, token_2, side, qty_1, qty_2))
+
+    def delete_pair_order(self, token_1, token_2):
+        """Удаляет запись из таблицы pairs по ключу (token_1, token_2)"""
+        query = """DELETE FROM pairs
+        WHERE token_1 = %s AND token_2 = %s"""
+        with self.conn.cursor() as cur:
+            cur.execute(query, (token_1, token_2))
+
+
     def close_order(self, token, exchange, market_type, qty, close_price, close_usdt_amount, close_fee, closed_at=None):
         """
         Переносит информацию из таблицы current_orders в таблицу trading_history
@@ -410,7 +430,7 @@ class DBManager:
         self,
         exchange: str,
         market_type: str,
-        symbol: str,
+        symbol: str | None = None,
         interval: str = "1min",   # параметр агрегации
         start_date: datetime | None = None,
         end_date: datetime | None = None,
@@ -430,8 +450,7 @@ class DBManager:
             polars.DataFrame с историей ордербука
         """
 
-        # Маппинг допустимых таблиц
-        valid_intervals = {"1min", "5min", "15min", "1h"}
+        valid_intervals = {"1min", "1h", "4h"}
         if interval not in valid_intervals:
             raise ValueError(f"Недопустимый интервал: {interval}. Разрешено: {valid_intervals}")
 
@@ -443,10 +462,13 @@ class DBManager:
             FROM {table}
             WHERE exchange = %s
             AND market_type = %s
-            AND token = %s
         """
 
-        params = [exchange, market_type, symbol]
+        params = [exchange, market_type]
+
+        if symbol is not None:
+            query += " AND token = %s"
+            params.append(symbol)
 
         # Фильтры по времени
         if start_date is not None:
