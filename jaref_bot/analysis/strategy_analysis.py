@@ -112,11 +112,14 @@ def analyze_strategy(df: pl.DataFrame, start_date, end_date,
     metrics['max_loss'] = round(min(df['total_profit'].min(), 0), 2)
     metrics['avg_profit'] = round(df['total_profit'].mean(), 2)
 
+    std = df['total_profit'].std()
+    add_param = 10 # Настраиваемый параметр, который добавляется к знаменателю, чтобы сгладить
+                   # разницу между слабоплюсовым, но безубыточным trades_df,
+                   # и сильно более плюсовым, но имеющим просадку датафреймом
+                   # Чем больше add_param, тем меньше преимущество у безубыточного df.
 
-    profit_ratio = round(df['total_profit'].sum() / (abs(metrics['max_drawdown']) + 1), 3)
-
-    metrics['profit_ratio'] = profit_ratio
-
+    profit_ratio = 10 * df['total_profit'].sum() / (abs(metrics['max_drawdown']) + add_param) / (std + add_param)
+    metrics['profit_ratio'] = round(profit_ratio, 3)
 
     return metrics
 

@@ -12,7 +12,6 @@ import hmac
 import hashlib
 import base64
 import json
-from decimal import Decimal, getcontext, InvalidOperation
 import logging
 
 logging.basicConfig(level=logging.INFO,
@@ -20,9 +19,6 @@ logging.basicConfig(level=logging.INFO,
 logging.getLogger('aiohttp').setLevel('ERROR')
 logging.getLogger('asyncio').setLevel('ERROR')
 logger = logging.getLogger()
-
-# Устанавливаем точность округления Decimal чисел
-getcontext().prec = 8
 
 class BaseTrade:
     def place_market_order(self, market_type, symbol, side, qty, ct_val=1,
@@ -131,14 +127,17 @@ class BybitTrade(BaseTrade):
         side = side.capitalize()
         price = price if price else ''
         curr_time = int(datetime.now().timestamp()*1000)
-        data = '{' + f'"category": "{market_type}","symbol": "{sym}","side": "{side}","orderType": "{order_type}","qty": "{qty}","price": "{price}"' + '}'
+        data = f'{{"category": "{market_type}","symbol": "{sym}","side": "{side}","orderType": "{order_type}","qty": "{qty}"}}'
+        if price:
+            data = data[:-1] + f',"price": "{price}"'
+
         if trigger_price:
             if side == 'Buy':
-                data = data[:-1] + f',"triggerPrice": "{trigger_price}","triggerDirection": "1"' + '}'
+                data = data[:-1] + f',"triggerPrice": "{trigger_price}","triggerDirection": "1"}}'
             elif side == 'Sell':
-                data = data[:-1] + f',"triggerPrice": "{trigger_price}", "triggerDirection": "2"' + '}'
+                data = data[:-1] + f',"triggerPrice": "{trigger_price}", "triggerDirection": "2"}}'
         if stop_loss:
-            data = data[:-1] + f',"stopLoss": "{stop_loss}"' + '}'
+            data = data[:-1] + f',"stopLoss": "{stop_loss}","slTriggerBy": "LastPrice"}}'
 
         sign = self.hashing(str(curr_time) + self.api_key + '5000' + data)
         headers = self._prepare_headers(ts=curr_time, sign=sign)
@@ -223,17 +222,17 @@ class BybitTrade(BaseTrade):
         base, quote = token[:-4], token[-4:]
         token = base + '_' + quote
 
-        leverage = Decimal(data['leverage'])
-        price = Decimal(data['avgPrice'])
-        usdt_amount = Decimal(data['positionBalance']) # Начальная стоимость в usdt. Да, проверил.
+        leverage = float(data['leverage'])
+        price = float(data['avgPrice'])
+        usdt_amount = float(data['positionBalance']) # Начальная стоимость в usdt. Да, проверил.
         side = data['side'].lower()
-        size = Decimal(data['size'])
+        size = float(data['size'])
 
-        fee_perc = Decimal(self.fees[market_type + '_' + order_type])
-        fee = (usdt_amount * fee_perc).normalize()
+        fee_perc = float(self.fees[market_type + '_' + order_type])
+        fee = (usdt_amount * fee_perc)
 
-        realized_pnl = Decimal(data['curRealisedPnl'])
-        unrealized_pnl = Decimal(data['unrealisedPnl'])
+        realized_pnl = float(data['curRealisedPnl'])
+        unrealized_pnl = float(data['unrealisedPnl'])
 
         return {'exchange': 'bybit', 'market_type': market_type, 'order_type': order_type,
                 'token': token, 'leverage': leverage, 'price': price,
@@ -257,10 +256,7 @@ class BybitTrade(BaseTrade):
         response = requests.get(url=url, headers=headers).json()
 
         # return response
-        try:
-            return self._position_handler(response, market_type, order_type)
-        except InvalidOperation:
-            return None
+        return self._position_handler(response, market_type, order_type)
 
     def _order_handler(self, resp, market_type):
         data = resp['result']['list'][0]
@@ -274,12 +270,12 @@ class BybitTrade(BaseTrade):
 
         order_type = data['orderType'].lower()
         status = data['orderStatus'].lower()
-        price = Decimal(data['avgPrice']) # Цена по которой ордер сматчился
-        limit_price = Decimal(data['price']) # Заявочная цена для лимитного ордера
-        usdt_amount = Decimal(data['cumExecValue'])
+        price = float(data['avgPrice']) # Цена по которой ордер сматчился
+        limit_price = float(data['price']) # Заявочная цена для лимитного ордера
+        usdt_amount = float(data['cumExecValue'])
         side = data['side'].lower()
-        size = Decimal(data['cumExecQty'])
-        fee = Decimal(data['cumExecFee'])
+        size = float(data['cumExecQty'])
+        fee = -float(data['cumExecFee'])
 
         return {'exchange': 'bybit', 'market_type': market_type, 'order_type': order_type,
                 'status': status, 'token': token, 'price': price, 'limit_price': limit_price,
@@ -298,10 +294,7 @@ class BybitTrade(BaseTrade):
         response = requests.get(url=url, headers=headers).json()
 
         # return response
-        try:
-            return self._order_handler(response, market_type)
-        except InvalidOperation:
-            return None
+        return self._order_handler(response, market_type)
 
     def _get_order_history(self, market_type, settle_coin, **kwargs):
         url = self.main_url + '/v5/order/realtime'
@@ -437,8 +430,7 @@ class OkxTrade(OkxClient, BaseTrade):
         """
         sym = self._create_symbol_name(market_type, symbol)
         price = price if price else ''
-        if isinstance(price, Decimal):
-            price = price.normalize().to_eng_string()
+
         body = {
             'instId': sym,
             'tdMode': margin_mode,   # Margin mode 'cross', 'isolated'; Non-Margin mode 'cash'
@@ -452,15 +444,11 @@ class OkxTrade(OkxClient, BaseTrade):
             body['tgtCcy'] = 'base_ccy' # Считаем qty считаем в базовой валюте
         elif market_type == 'linear':
             body['sz'] /= ct_val
-            # body['posSide'] = 'net'
-            if isinstance(ct_val, Decimal):
-                body['sz'] = body['sz'].to_eng_string()
+
         else:
             raise Exception('Unknown market_type. Should be "linear" or "spot".')
 
         if stop_loss:
-            if isinstance(stop_loss, Decimal):
-                stop_loss = stop_loss.to_eng_string()
             body['attachAlgoOrds'] = {'slTriggerPx': stop_loss, 'slOrdPx': '-1'}
 
         # print(body)
@@ -552,17 +540,17 @@ class OkxTrade(OkxClient, BaseTrade):
         syms = token.split('-')
         token = syms[0] + '_' + syms[1]
 
-        leverage = Decimal(data['lever'])
-        price = Decimal(data['avgPx'])
+        leverage = float(data['lever'])
+        price = float(data['avgPx'])
 
         side = 'buy' if float(data['pos']) > 0 else 'sell'
-        qty = abs(Decimal(data['pos']) * ct_val)
-        usdt_amount = Decimal(data['margin'])
-        fee = abs(Decimal(data['fee']))
+        qty = abs(float(data['pos']) * ct_val)
+        usdt_amount = float(data['margin'])
+        fee = abs(float(data['fee']))
 
-        realized_pnl = Decimal(data['realizedPnl']).normalize()
-        unrealized_pnl = Decimal(data['uplLastPx']).normalize()
-        curr_position_value = Decimal(data['notionalUsd']).normalize()
+        realized_pnl = float(data['realizedPnl'])
+        unrealized_pnl = float(data['uplLastPx'])
+        curr_position_value = float(data['notionalUsd'])
 
         return {'exchange': 'okx', 'market_type': market_type, 'order_type': order_type,
                 'token': token, 'leverage': leverage, 'price': price,
@@ -578,10 +566,7 @@ class OkxTrade(OkxClient, BaseTrade):
         response = self._request_without_params(method='GET',
                     request_path=path)
         # return response
-        try:
-            return self._position_handler(response, market_type, order_type, ct_val)
-        except InvalidOperation:
-            return None
+        return self._position_handler(response, market_type, order_type, ct_val)
 
     def _order_handler(self, resp, market_type, ct_val):
         data = resp['data'][0]
@@ -594,13 +579,13 @@ class OkxTrade(OkxClient, BaseTrade):
         status = data['state']
         order_type = data['ordType']
 
-        price = Decimal(data['fillPx'])
-        limit_price = Decimal(data['px'])
+        price = float(data['fillPx'])
+        limit_price = float(data['px'])
 
         side = data['side']
-        qty = Decimal(data['sz']) * ct_val
-        fee = abs(Decimal(data['fee']))
-        usdt_amount = (qty * price).normalize()
+        qty = float(data['sz']) * ct_val
+        fee = abs(float(data['fee']))
+        usdt_amount = qty * price
 
         return {'exchange': 'okx', 'market_type': market_type, 'order_type': order_type,
                 'status': status, 'token': token, 'price': price, 'limit_price': limit_price,
@@ -612,10 +597,7 @@ class OkxTrade(OkxClient, BaseTrade):
         response = self._request_without_params(method='GET',
                     request_path=path)
         # return response
-        try:
-            return self._order_handler(response, market_type, ct_val)
-        except InvalidOperation:
-            return None
+        return self._order_handler(response, market_type, ct_val)
 
 
 
@@ -690,14 +672,9 @@ class GateTrade(BaseTrade):
         if side == 'sell':
             size = -size
 
-        if isinstance(ct_val, Decimal):
-            size = size.to_eng_string()
-
         symbol = self._create_symbol_name(symbol)
-        if isinstance(price, Decimal):
-            price = price.normalize().to_eng_string()
-        else:
-            price = str(price) if price else '0'
+        price = str(price) if price else '0'
+
         tif = "ioc" if order_type == 'market' else 'gtc'
         body = '{"contract":"' + symbol + '", "size":' + size + ', "price": "' + price + '", "tif": "' + tif + '", "close": "false"}'
         sign_headers = self.gen_sign('POST', prefix + url, query_param, body)
@@ -798,15 +775,15 @@ class GateTrade(BaseTrade):
 
         token = resp['contract']
 
-        leverage = Decimal(resp['leverage'])
-        price = Decimal(resp['entry_price'])
+        leverage = float(resp['leverage'])
+        price = float(resp['entry_price'])
         side = 'buy' if float(resp['size']) > 0 else 'sell'
-        qty = abs(Decimal(resp['size']) * ct_val)
-        usdt_amount = Decimal(resp['margin'])
-        curr_position_value = Decimal(resp['value'])
-        fee = abs(Decimal(resp['pnl_fee']))
-        realized_pnl = Decimal(resp['realised_pnl'])
-        unrealized_pnl = Decimal(resp['unrealised_pnl'])
+        qty = abs(float(resp['size']) * ct_val)
+        usdt_amount = float(resp['margin'])
+        curr_position_value = float(resp['value'])
+        fee = abs(float(resp['pnl_fee']))
+        realized_pnl = float(resp['realised_pnl'])
+        unrealized_pnl = float(resp['unrealised_pnl'])
 
         return {'exchange': 'gate', 'market_type': market_type, 'order_type': order_type,
                 'token': token, 'leverage': leverage, 'price': price,
@@ -835,21 +812,18 @@ class GateTrade(BaseTrade):
         response = requests.request('GET', host + prefix + url + "?" + query_param,
                                     headers=headers).json()
         # return response
-        try:
-            return self._position_handler(response, market_type, order_type, ct_val)
-        except InvalidOperation:
-            return None
+        return self._position_handler(response, market_type, order_type, ct_val)
 
     def _order_handler(self, data, market_type, order_type, ct_val):
         token = data['contract']
         _id = data['id']
         status = data['status'].lower()
-        price = Decimal(data['fill_price']) # Цена по которой ордер сматчился
-        limit_price = Decimal(data['price']) # Заявочная цена для лимитного ордера
+        price = float(data['fill_price']) # Цена по которой ордер сматчился
+        limit_price = float(data['price']) # Заявочная цена для лимитного ордера
         side = 'buy' if float(data['size']) > 0 else 'sell'
-        qty = abs(Decimal(data['size']) * ct_val)
-        usdt_amount = Decimal(qty * price).normalize()
-        fee = (Decimal(data['tkfr']) * usdt_amount).normalize()
+        qty = abs(float(data['size']) * ct_val)
+        usdt_amount = float(qty * price)
+        fee = float(data['tkfr']) * usdt_amount
 
         return {'exchange': 'gate', 'market_type': market_type, 'order_type': order_type,
                 'status': status, 'token': token, 'price': price, 'limit_price': limit_price,

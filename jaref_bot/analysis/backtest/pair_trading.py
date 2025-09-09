@@ -369,6 +369,17 @@ def backtest(df, token_1, token_2, dp_1, dp_2, ps_1, ps_2, thresh_low_in, thresh
 
     if trades_df.height > 0:
         profit = trades_df['total_profit'].sum()
+
+        trades_df = trades_df.with_columns(
+            pl.from_epoch(pl.col("open_ts"), time_unit="s"
+                        ).dt.convert_time_zone("Europe/Moscow"
+                        ).alias('open_time'),
+            pl.from_epoch(pl.col("close_ts"), time_unit="s"
+                        ).dt.convert_time_zone("Europe/Moscow"
+                        ).alias('close_time'),
+        ).select('open_time', 'open_ts', 'close_time', 'close_ts', 'qty_1', 'qty_2',
+                 'open_price_1', 'close_price_1', 'open_price_2', 'close_price_2',
+                 'pos_side', 'fees', 'profit_1', 'profit_2', 'total_profit', 'reason')
     else:
         profit = 0
 
@@ -388,8 +399,13 @@ Profit: {profit:.2f}.')
 
             if dp_1 >= 1:
                 qty_1 = int(qty_1)
+            else:
+                qty_1 = _round(qty_1, dp_1)
+
             if dp_2 >= 1:
                 qty_2 = int(qty_2)
+            else:
+                qty_2 = _round(qty_2, dp_2)
 
             if etype == 1:
                 print(f"[ Open] {open_date}. {side_1} {qty_1} {token_1}, {side_2} {qty_2} {token_2}")

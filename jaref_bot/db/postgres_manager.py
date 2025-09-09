@@ -254,7 +254,7 @@ class DBManager:
             # Устанавливаем московское время для закрытия, если не указано
             if closed_at is None:
                 Moscow_TZ = timezone(timedelta(hours=3))
-                closed_at = datetime.now(Moscow_TZ)
+                closed_at = datetime.now(Moscow_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
             cursor = self.conn.cursor()
 
@@ -262,7 +262,7 @@ class DBManager:
             cursor.execute("""
                 SELECT token, exchange, market_type, order_type, order_side,
                     price as open_price, usdt_amount as open_usdt_amount,
-                    qty, usdt_fee as open_fee, leverage, created_at
+                    qty, realized_pnl as realized_pnl, leverage, created_at
                 FROM current_orders
                 WHERE token = %s AND exchange = %s AND market_type = %s
             """, (token, exchange, market_type))
@@ -289,6 +289,7 @@ class DBManager:
 
             # Начинаем транзакцию
             self.conn.autocommit = False
+            real_pnl = order_data['realized_pnl'] + close_fee
 
             try:
                 # Проверяем, закрывается ли ордер полностью или частично
@@ -300,13 +301,13 @@ class DBManager:
                         INSERT INTO trading_history (
                             token, exchange, market_type, order_type, order_side,
                             open_price, close_price, open_usdt_amount, close_usdt_amount,
-                            qty, open_fee, close_fee, leverage, created_at, closed_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            qty, realized_pnl, leverage, created_at, closed_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (
                         order_data['token'], order_data['exchange'], order_data['market_type'],
                         order_data['order_type'], order_data['order_side'],
                         order_data['open_price'], close_price, order_data['open_usdt_amount'],
-                        close_usdt_amount, qty, order_data['open_fee'], close_fee,
+                        close_usdt_amount, qty, real_pnl,
                         order_data['leverage'], order_data['created_at'], closed_at
                     ))
 
@@ -324,27 +325,27 @@ class DBManager:
 
                     # Пересчитываем значения
                     adjusted_open_usdt_amount = float(order_data['open_usdt_amount']) * ratio
-                    adjusted_open_fee = float(order_data['open_fee']) * ratio
+                    adjusted_pnl = float(order_data['open_fee']) * + close_fee
 
                     # Добавляем запись в историю торговли
                     cursor.execute("""
                         INSERT INTO trading_history (
                             token, exchange, market_type, order_type, order_side,
                             open_price, close_price, open_usdt_amount, close_usdt_amount,
-                            qty, open_fee, close_fee, leverage, created_at, closed_at
+                            qty, realized_pnl, leverage, created_at, closed_at
                         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (
                         order_data['token'], order_data['exchange'], order_data['market_type'],
                         order_data['order_type'], order_data['order_side'],
                         order_data['open_price'], close_price, adjusted_open_usdt_amount,
-                        close_usdt_amount, qty, adjusted_open_fee, close_fee,
+                        close_usdt_amount, qty, adjusted_pnl,
                         order_data['leverage'], order_data['created_at'], closed_at
                     ))
 
                     # Обновляем количество в текущих ордерах
                     new_qty = float(order_data['qty_current']) - float(qty)
                     new_usdt_amount = float(order_data['open_usdt_amount']) - adjusted_open_usdt_amount
-                    new_open_fee = float(order_data['open_fee']) - adjusted_open_fee
+                    new_open_fee = float(order_data['open_fee']) - adjusted_pnl
                     cursor.execute("""
                         UPDATE current_orders
                         SET qty = %s, usdt_amount = %s, usdt_fee = %s
@@ -706,7 +707,7 @@ class DBManager:
     def get_columns(self, table_name):
         """Получить список столбцов таблицы"""
         query = """
-            SELECT column_name, data_type, is_nullable
+            SELECT column_name, data_type
             FROM information_schema.columns
             WHERE table_name = %s
             ORDER BY ordinal_position;
