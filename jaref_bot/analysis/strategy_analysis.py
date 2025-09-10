@@ -74,6 +74,7 @@ def analyze_strategy(df: pl.DataFrame, start_date, end_date,
 
     metrics['initial_balance'] = initial_balance
     metrics['final_balance'] = round(df['balance'][-1], 4)
+    metrics['profit'] = round(df['total_profit'].sum(), 2)
 
     # --- Доходность ---
     metrics["total_perc_return"] = round((metrics['final_balance']

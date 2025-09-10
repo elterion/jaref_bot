@@ -1,19 +1,21 @@
 import polars as pl
 import polars_ols as pls
 import numpy as np
-from numba import njit, prange
+from numba import njit
 
-def make_trunc_df(df, timeframe, token_1, token_2, start_date=None, end_date=None, method="last"):
+def make_trunc_df(df, timeframe, token_1, token_2, start_date=None, end_date=None, method="last", offset='0h'):
     select_spread = True if 'spread' in df.columns else False
 
     df = df.with_columns(
             ((pl.col(f'{token_1}_bid_price') + pl.col(f'{token_1}_ask_price')) / 2).alias(token_1),
             ((pl.col(f'{token_2}_bid_price') + pl.col(f'{token_2}_ask_price')) / 2).alias(token_2),
+            pl.min_horizontal(f'{token_1}_bid_size', f'{token_1}_ask_size').alias(f'{token_1}_size'),
+            pl.min_horizontal(f'{token_2}_bid_size', f'{token_2}_ask_size').alias(f'{token_2}_size')
         )
     if select_spread:
-        df = df.select('time', 'ts', token_1, token_2, 'spread')
+        df = df.select('time', 'ts', token_1, token_2, f'{token_1}_size', f'{token_2}_size', 'spread')
     else:
-        df = df.select('time', 'ts', token_1, token_2)
+        df = df.select('time', 'ts', token_1, token_2, f'{token_1}_size', f'{token_2}_size')
 
     # условия агрегации
     if method == "last":
@@ -21,6 +23,8 @@ def make_trunc_df(df, timeframe, token_1, token_2, start_date=None, end_date=Non
             pl.col("ts").first(),
             pl.col(token_1).last().alias(token_1),
             pl.col(token_2).last().alias(token_2),
+            pl.col(f'{token_1}_size').sum(),
+            pl.col(f'{token_2}_size').sum(),
         ]
 
         if select_spread:
@@ -31,6 +35,8 @@ def make_trunc_df(df, timeframe, token_1, token_2, start_date=None, end_date=Non
             pl.col("ts").first(),
             ((pl.col(token_1).last() + pl.col(token_1).max() + pl.col(token_1).min()) / 3).alias(token_1),
             ((pl.col(token_2).last() + pl.col(token_2).max() + pl.col(token_2).min()) / 3).alias(token_2),
+            pl.col(f'{token_1}_size').sum(),
+            pl.col(f'{token_2}_size').sum(),
         ]
 
         if select_spread:
@@ -42,6 +48,7 @@ def make_trunc_df(df, timeframe, token_1, token_2, start_date=None, end_date=Non
     df = df.group_by_dynamic(
                 index_column="time",
                 every=timeframe,
+                offset=offset,
                 label='left'
             ).agg(agg_exprs)
     if start_date:
@@ -101,6 +108,8 @@ def make_df_from_orderbooks(df_1, df_2, token_1, token_2,
 def make_zscore_df(df, token_1, token_2, wind, method='dist'):
     if method == 'dist':
         return df.lazy().with_columns(
+                (pl.col(token_1).log() - pl.col(token_2).log()).alias('spread')
+            ).with_columns(
                 pl.col('spread').rolling_mean(wind).alias(f'mean'),
                 pl.col('spread').rolling_std(wind).alias(f'std')
             ).with_columns(
@@ -136,11 +145,10 @@ def get_zscore(df, token_1, token_2, winds, method):
         alpha, beta, zscore = get_lr_zscore(t1, t2, winds_np)
         return alpha, beta, zscore
     elif method == 'dist':
-        spread = df['spread'].to_numpy()
-        means, stds, z_scores = get_dist_zscore(spread, winds_np)
+        means, stds, z_scores = get_dist_zscore(t1, t2, winds_np)
         return means, stds, z_scores
 
-@njit(fastmath=True)
+@njit
 def get_lr_zscore(t1, t2, winds):
     """
     t1, t2: 1D np.ndarray(float64) длины n
@@ -241,13 +249,15 @@ def get_lr_zscore(t1, t2, winds):
 
     return alpha_full[:, -1], beta_full[:, -1], z_full[:, -1]
 
-@njit(fastmath=True)
-def get_dist_zscore(spread: np.ndarray, winds: np.ndarray):
+@njit
+def get_dist_zscore(t1: np.ndarray, t2: np.ndarray, winds: np.ndarray):
     """
     spread: 1D float64 array (n,)
     winds: 1D int64 array (m,)
     returns: means (m,n), stds (m,n), zs (m,n)
     """
+    spread = np.log(t1) - np.log(t2)
+
     n = spread.shape[0]
     m = winds.shape[0]
 
@@ -303,3 +313,231 @@ def get_dist_zscore(spread: np.ndarray, winds: np.ndarray):
                 zs[wi, i] = np.nan
 
     return means[:, -1], stds[:, -1], zs[:, -1]
+
+@njit
+def binary_search_left(arr, x):
+    """Найти индекс первой позиции в arr, где arr[idx] >= x.
+       arr отсортирован по возрастанию."""
+    lo = 0
+    hi = arr.shape[0]
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if arr[mid] < x:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+@njit
+def median_small(src, length):
+    """Медиана для маленького массива length<=6: простая сортировка вставками."""
+    # копируем в маленький массив
+    tmp = np.empty(length, dtype=np.float64)
+    for i in range(length):
+        tmp[i] = src[i]
+    # insertion sort
+    for i in range(1, length):
+        key = tmp[i]
+        j = i - 1
+        while j >= 0 and tmp[j] > key:
+            tmp[j+1] = tmp[j]
+            j -= 1
+        tmp[j+1] = key
+    # медиана
+    if length == 0:
+        return np.nan
+    if (length % 2) == 1:
+        return tmp[length // 2]
+    else:
+        return 0.5 * (tmp[length//2 - 1] + tmp[length//2])
+
+@njit
+def create_df_loop(
+    nrows,
+    sec_ts, sec_t1, sec_t2, sec_s1, sec_s2,
+    hour4_ts, hour4_t1, hour4_t2, max_hour4_wind,
+    hour1_ts, hour1_t1, hour1_t2, max_hour1_wind,
+    min_order,
+    hour4_winds, hour1_winds,
+    ts_buf, t1_buf, t2_buf, s1_buf, s2_buf,
+    beta4_buf, z4_buf, beta1_buf, z1_buf
+):
+    pos = 0
+    # временные массивы (максимальный размер для окон + 1)
+    tmp_win4_t1 = np.empty(max_hour4_wind + 1, dtype=np.float64)
+    tmp_win4_t2 = np.empty(max_hour4_wind + 1, dtype=np.float64)
+    tmp_win1_t1 = np.empty(max_hour1_wind + 1, dtype=np.float64)
+    tmp_win1_t2 = np.empty(max_hour1_wind + 1, dtype=np.float64)
+    tmp_last6_t1 = np.empty(6, dtype=np.float64)
+    tmp_last6_t2 = np.empty(6, dtype=np.float64)
+
+    for i in range(nrows):
+        # 1) базовые поля из sec arrays
+        cur_ts = sec_ts[i]
+        cur_t1 = sec_t1[i]
+        cur_t2 = sec_t2[i]
+        cur_s1 = sec_s1[i]
+        cur_s2 = sec_s2[i]
+
+        # 2) последние 6 строк и медиана (фильтр по объёму)
+        start6 = i - 6
+        if start6 < 0:
+            start6 = 0
+        end6 = i
+        sel_cnt = 0
+        for j in range(start6, end6):
+            vol1 = sec_s1[j] * sec_t1[j]
+            vol2 = sec_s2[j] * sec_t2[j]
+            if (vol1 > min_order) and (vol2 > min_order):
+                tmp_last6_t1[sel_cnt] = sec_t1[j]
+                tmp_last6_t2[sel_cnt] = sec_t2[j]
+                sel_cnt += 1
+
+        if sel_cnt == 0:
+            t1_med = cur_t1
+            t2_med = cur_t2
+        else:
+            t1_med = median_small(tmp_last6_t1, sel_cnt)
+            t2_med = median_small(tmp_last6_t2, sel_cnt)
+
+        # 3) hour4_stat: взять записи hour4_ts < cur_ts и хвост длины max_hour4_wind
+        idx4 = binary_search_left(hour4_ts, cur_ts)
+        start4 = idx4 - max_hour4_wind
+        if start4 < 0:
+            start4 = 0
+        len4 = idx4 - start4
+        for j in range(len4):
+            tmp_win4_t1[j] = hour4_t1[start4 + j]
+            tmp_win4_t2[j] = hour4_t2[start4 + j]
+        tmp_win4_t1[len4] = t1_med
+        tmp_win4_t2[len4] = t2_med
+        total4_len = len4 + 1
+
+        # 4) hour1_stat аналогично
+        idx1 = binary_search_left(hour1_ts, cur_ts)
+        start1 = idx1 - max_hour1_wind
+        if start1 < 0:
+            start1 = 0
+        len1 = idx1 - start1
+        for j in range(len1):
+            tmp_win1_t1[j] = hour1_t1[start1 + j]
+            tmp_win1_t2[j] = hour1_t2[start1 + j]
+        tmp_win1_t1[len1] = t1_med
+        tmp_win1_t2[len1] = t2_med
+        total1_len = len1 + 1
+
+        # Создаём короткие массивы (копируем) — это numba-совместимо
+        small4_t1 = np.empty(total4_len, dtype=np.float64)
+        small4_t2 = np.empty(total4_len, dtype=np.float64)
+        for j in range(total4_len):
+            small4_t1[j] = tmp_win4_t1[j]
+            small4_t2[j] = tmp_win4_t2[j]
+
+        small1_t1 = np.empty(total1_len, dtype=np.float64)
+        small1_t2 = np.empty(total1_len, dtype=np.float64)
+        for j in range(total1_len):
+            small1_t1[j] = tmp_win1_t1[j]
+            small1_t2[j] = tmp_win1_t2[j]
+
+        alpha4, beta4_vals, z4_vals = get_lr_zscore(small4_t1, small4_t2, hour4_winds)
+        alpha1, beta1_vals, z1_vals = get_lr_zscore(small1_t1, small1_t2, hour1_winds)
+
+        # 6) Записываем все в буферы
+        ts_buf[pos] = cur_ts
+        t1_buf[pos] = cur_t1
+        t2_buf[pos] = cur_t2
+        s1_buf[pos] = cur_s1
+        s2_buf[pos] = cur_s2
+
+        # beta4/z4 для всех окон
+        for k in range(beta4_vals.shape[0]):
+            beta4_buf[pos, k] = beta4_vals[k]
+            z4_buf[pos, k] = z4_vals[k]
+        for k in range(beta1_vals.shape[0]):
+            beta1_buf[pos, k] = beta1_vals[k]
+            z1_buf[pos, k] = z1_vals[k]
+
+        pos += 1
+
+    return pos
+
+def create_df(token_1, token_2, df_sec, df_4hour, df_hour,
+              hour4_winds, hour1_winds, spread_method, min_order):
+
+    method_is_lr = 1 if spread_method == 'lr' else 0
+
+    max_hour1_wind = 2 * int(hour1_winds.max())
+    max_hour4_wind = 2 * int(hour4_winds.max())
+
+    # --- Перевод polars в numpy ---
+    tss = df_sec['ts'].to_numpy()
+    times = df_sec['time'].to_numpy()
+    size1 = df_sec[f'{token_1}_size'].to_numpy()   # np.ndarray, shape (n,)
+    price1 = df_sec[token_1].to_numpy()
+    size2 = df_sec[f'{token_2}_size'].to_numpy()
+    price2 = df_sec[token_2].to_numpy()
+
+    n = tss.shape[0]
+
+    # df_4hour arrays (предполагается что df_4hour отсортирован по ts по возрастанию)
+    hour4_ts = df_4hour['ts'].to_numpy()
+    hour4_t1 = df_4hour[token_1].to_numpy()
+    hour4_t2 = df_4hour[token_2].to_numpy()
+    # (sizes если нужно — добавьте аналогично)
+
+    # df_hour arrays
+    hour1_ts = df_hour['ts'].to_numpy()
+    hour1_t1 = df_hour[token_1].to_numpy()
+    hour1_t2 = df_hour[token_2].to_numpy()
+
+    # --- Предвыделение буферов для rows_buffer ---
+    ts_buf = np.empty(n, dtype=np.int64)
+    t1_buf = np.empty(n, dtype=np.float64)
+    t2_buf = np.empty(n, dtype=np.float64)
+    s1_buf = np.empty(n, dtype=np.float64)
+    s2_buf = np.empty(n, dtype=np.float64)
+
+    # --- Кол-во окон ---
+    m4 = hour4_winds.shape[0]
+    m1 = hour1_winds.shape[0]
+
+    # --- 2D буферы: (rows, num_windows) ---
+    beta4_buf = np.full((n, m4), np.nan, dtype=np.float64)
+    z4_buf = np.full((n, m4), np.nan, dtype=np.float64)
+    beta1_buf = np.full((n, m1), np.nan, dtype=np.float64)
+    z1_buf = np.full((n, m1), np.nan, dtype=np.float64)
+
+    pos = create_df_loop(
+        n,
+        tss, price1, price2, size1, size2,
+        hour4_ts, hour4_t1, hour4_t2, max_hour4_wind,
+        hour1_ts, hour1_t1, hour1_t2, max_hour1_wind,
+        min_order,
+        hour4_winds, hour1_winds,
+        ts_buf, t1_buf, t2_buf, s1_buf, s2_buf,
+        beta4_buf, z4_buf, beta1_buf, z1_buf
+    )
+
+    # --- Собираем итоговый polars DataFrame из буферов (только заполненные строки) ---
+    out = {
+        'time': times[:pos],
+        'ts': ts_buf[:pos],
+        token_1: t1_buf[:pos],
+        token_2: t2_buf[:pos],
+        f'{token_1}_size': s1_buf[:pos],
+        f'{token_2}_size': s2_buf[:pos],
+    }
+
+    for i in range(m4):
+        w = int(hour4_winds[i])
+        out[f'beta_{w}_4h'] = beta4_buf[:pos, i]
+        out[f'z_score_{w}_4h'] = z4_buf[:pos, i]
+    for i in range(m1):
+        w = int(hour1_winds[i])
+        out[f'beta_{w}_1h'] = beta1_buf[:pos, i]
+        out[f'z_score_{w}_1h'] = z1_buf[:pos, i]
+
+    return pl.DataFrame(out, infer_schema_length=None).drop_nans(
+                ).with_columns(
+                    pl.col('time').dt.convert_time_zone('Europe/Moscow')
+                )

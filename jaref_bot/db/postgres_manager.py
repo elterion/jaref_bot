@@ -489,17 +489,20 @@ class DBManager:
 
         return pl.DataFrame(data, schema=columns, orient="row")
 
-    def get_raw_orderbooks(self, exchange, market_type, token, start_time=None, end_time=None):
+    def get_raw_orderbooks(self, exchange, market_type, token=None, start_time=None, end_time=None):
         query = """
             SELECT exchange, market_type, token, time,
                    bid_price, bid_size, ask_price, ask_size
             FROM raw_orderbook_data
             WHERE exchange = %s
               AND market_type = %s
-              AND token = %s
         """
 
-        params = [exchange, market_type, token]
+        params = [exchange, market_type]
+
+        if token is not None:
+            query += " AND token = %s"
+            params.append(token)
 
         if start_time is not None:
             query += " AND time >= %s"
@@ -510,6 +513,7 @@ class DBManager:
             params.append(end_time)
 
         with self.conn.cursor() as cur:
+            # return pl.read_database(query, cur)
             cur.execute(query, params)
             rows = cur.fetchall()
             colnames = [desc[0] for desc in cur.description]

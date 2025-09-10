@@ -1,9 +1,11 @@
 from jaref_bot.analysis.backtest.pair_trading import backtest
 from jaref_bot.utils.pair_trading import make_df_from_orderbooks, make_trunc_df, get_zscore
+from jaref_bot.utils.pair_trading import create_df
 from jaref_bot.analysis.strategy_analysis import analyze_strategy
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import polars as pl
+import numpy as np
 from tqdm import tqdm
 import heapq
 from random import choice
@@ -19,7 +21,7 @@ def find_best_params(df, token_1, token_2, dp_1, dp_2, ps_1, ps_2,
                      in_params, out_params,
                      stop_loss_std=5.0, sl_method=None,
                      method_in='direct', method_out='direct', min_trades=10,
-                     leverage=1, n_best_params=5, verbose=0):
+                     leverage=1, n_best_params=2, verbose=0):
     """
     Параметры in_params и out_params передаются в виде положительных чисел.
 
@@ -64,16 +66,12 @@ def find_best_params(df, token_1, token_2, dp_1, dp_2, ps_1, ps_2,
                                             initial_balance=balance)
                 profit_ratio = metrics['profit_ratio']
 
-                pars = (thresh_low_in,
-                        thresh_high_in,
-                        thresh_low_out,
-                        thresh_high_out)
                 # dist = max(map(abs, pars)) - min(map(abs, pars))
                 if len(heap) < n_best_params:
-                    heapq.heappush(heap, (profit_ratio, tr.height, pars))
+                    heapq.heappush(heap, (profit_ratio, tr.height, thresh_in, thresh_out))
                 else:
                     if profit_ratio > heap[0][0]:
-                        heapq.heapreplace(heap, (profit_ratio, tr.height, pars))
+                        heapq.heapreplace(heap, (profit_ratio, tr.height, thresh_in, thresh_out))
     return heap
 
 def random_search(token_1, token_2, method, start_time, end_time, min_trades, n_top_params,
@@ -226,29 +224,29 @@ def grid_search(token_1, token_2, method, start_time, end_time, min_trades, n_to
             continue
 
         best_params = find_best_params(df, token_1, token_2,
-                dp_1, dp_2, ps_1, ps_2, n_best_params=5,
+                dp_1, dp_2, ps_1, ps_2, n_best_params=3,
                 in_params=in_params, out_params=out_params,
                 stop_loss_std=5.0, sl_method='leave', leverage=leverage,
                 method_in=method_in, method_out='direct', min_trades=min_trades,
                 verbose=verbose)
-        for profit, n_trades, params in best_params:
+        for profit, n_trades, thresh_in, thresh_out in best_params:
             if verbose > 0:
-                print(f'profit: {profit:.2f}. {n_trades=}; params: {params}')
+                print(f'profit: {profit:.2f}. {n_trades=}; params: {thresh_in, thresh_out}')
 
             if len(top_params) < n_top_params:
-                heapq.heappush(top_params, (profit, n_trades, tf, wind, params))
+                heapq.heappush(top_params, (profit, n_trades, tf, wind, thresh_in, thresh_out))
             else:
                 if profit > top_params[0][0]:
-                    heapq.heapreplace(top_params, (profit, n_trades, tf, wind, params))
+                    heapq.heapreplace(top_params, (profit, n_trades, tf, wind, thresh_in, thresh_out))
 
         if verbose > 0:
             print()
     # print(f'===== Top {n_top_params} params =====')
     for p in top_params:
-        tqdm.write(f'({p[0]:.2f}, "{token_1}", "{token_2}", "{p[2]}", {p[3]}, {', '.join(map(str, p[4]))})')
+        tqdm.write(f'({p[0]:.2f}, "{token_1}", "{token_2}", "{p[2]}", {p[3]}, {p[4]}, {p[5]})')
 
-def create_df(token_1, token_2, method, start_time, valid_time,
-              hour4_winds, hour1_winds):
+def create_data(token_1, token_2, method, start_time, valid_time,
+              hour4_winds, hour1_winds, min_order, write_to_file=True):
     if method == 'lr':
         return_spread = False
         log_spread = False
@@ -270,70 +268,29 @@ def create_df(token_1, token_2, method, start_time, valid_time,
     df_sec = make_trunc_df(df, timeframe='1s', token_1=token_1, token_2=token_2,
                            start_date=valid_time, method='last')
 
-    max_hour1_wind = 2 * max(hour1_winds) + 1
-    max_hour4_wind = 2 * max(hour4_winds) + 1
+    res_df = create_df(token_1, token_2, df_sec, df_4hour, df_hour, hour4_winds, hour1_winds, method, min_order)
+    if write_to_file:
+        res_df.write_parquet(f'./data/pair_backtest/{token_1}_{token_2}_{method}.parquet')
 
-    # --- Основной цикл ---
-    rows_buffer = []
-
-    for row in df_sec.iter_slices(1):
-        data_dict = {'time': row['time'][0], 'ts': row['ts'][0],
-                    token_1: row[token_1][0], token_2: row[token_2][0]}
-
-        # --- 4-ЧАСОВОЕ ОКНО ---
-        hour4_stat = df_4hour.filter(pl.col('ts') < row['ts']).tail(max_hour4_wind)
-        hour4_stat = hour4_stat.vstack(row)
-
-        if method == 'lr':
-            _, beta4, zscore4 = get_zscore(hour4_stat, token_1, token_2, winds=hour4_winds, method=method)
-
-            for i, window in enumerate(hour4_winds):
-                data_dict[f'beta_{window}_4h'] = beta4[i]
-                data_dict[f'z_score_{window}_4h'] = zscore4[i]
-        elif method == 'dist':
-            means, stds, zscore4 = get_zscore(hour4_stat, token_1, token_2, winds=hour4_winds, method=method)
-
-            for i, window in enumerate(hour4_winds):
-                data_dict[f'z_score_{window}_4h'] = zscore4[i]
-
-        # --- ЧАСОВОЕ ОКНО ---
-        hour1_stat = df_hour.filter(pl.col('ts') < row['ts']).tail(max_hour1_wind)
-        hour1_stat = hour1_stat.vstack(row)
-
-        if method == 'lr':
-            _, beta1, zscore1 = get_zscore(hour1_stat, token_1, token_2, winds=hour1_winds, method=method)
-
-            for i, window in enumerate(hour1_winds):
-                data_dict[f'beta_{window}_1h'] = beta1[i]
-                data_dict[f'z_score_{window}_1h'] = zscore1[i]
-        elif method == 'dist':
-            means, stds, zscore1 = get_zscore(hour1_stat, token_1, token_2, winds=hour1_winds, method=method)
-
-            for i, window in enumerate(hour1_winds):
-                data_dict[f'z_score_{window}_1h'] = zscore1[i]
-
-        rows_buffer.append(data_dict)
-
-    result_df = pl.DataFrame(rows_buffer, infer_schema_length=None)
-    result_df.write_parquet(f'./data/pair_backtest/{token_1}_{token_2}_{method}.parquet')
+    return res_df
 
 def main(token_1, token_2, method, create_df_flag, method_in,
          start_time, valid_time, end_time, min_trades, n_top_params, leverage,
-         search_type='grid', n_iters=100_000, verbose=0):
+         search_type='grid', min_order=50, n_iters=100_000, verbose=0):
 
-    hour4_winds = (6, 9, 12, 15, 18)
-    hour1_winds = (12, 18, 24, 36, 48)
+    hour4_winds = np.array([8, 10, 12, 14, 16, 18])
+    hour1_winds = np.array([12, 18, 24, 32])
 
     # Создадим датафрейм с z_score
     if create_df_flag:
-        create_df(token_1, token_2, method, start_time, valid_time,
-                hour4_winds, hour1_winds)
+        create_data(token_1, token_2, method, start_time, valid_time,
+                hour4_winds, hour1_winds, min_order)
 
     # Зададим пространство поиска наилучших параметров входа
     search_space = [('4h', w) for w in hour4_winds] + [('1h', w) for w in hour1_winds]
 
-    in_params = (1.6, 1.8, 2.0, 2.25, 2.5, 3.0)
-    out_params = (0.0, 0.25, 0.5, 1.0, 1.5, 2.0)
+    in_params = (1.8, 2.0)
+    out_params = (0.25, )
 
     if search_type == 'grid':
         grid_search(token_1, token_2, method, valid_time, end_time, min_trades, n_top_params,
@@ -347,8 +304,8 @@ def main(token_1, token_2, method, create_df_flag, method_in,
 if __name__ == '__main__':
     create_df_flag = True
     method = 'lr'
-    valid_length = 3
-    train_length = 4
+    valid_length = 1
+    train_length = 6
 
     end_time = datetime.now(ZoneInfo("Europe/Moscow"))
     # end_time = datetime(2025, 9, 8, 12, 40, 15, tzinfo=ZoneInfo("Europe/Moscow"))
@@ -357,23 +314,46 @@ if __name__ == '__main__':
     start_time = valid_time - timedelta(days=train_length)
 
     min_trades = 2
-    n_top_params = 5
+    n_top_params = 1 # Сколько лучших параметров печатать на экране
     leverage = 2
+    min_order = 50
 
     method_in = 'direct'
 
-    tokens = [('FIL', 'ONDO'), ('APT', 'FIL'), ('CELO', 'ONDO'), ('GTC', 'OP'),
-              ('ENJ', 'VET'), ('MANA', 'ONDO'), ('GRT', 'VET'), ('APT', 'ONDO'),
-              ('ARKM', 'ONDO'), ('FIL', 'SNX'), ('ARB', 'ONDO'), ('GMT', 'VET'),
-              ('ENJ', 'ROSE'), ('ROSE', 'VET'), ('GALA', 'GMT'), ('FLOW', 'SNX'),
-              ('GRT', 'SAND'), ('CELO', 'GRT'), ('FLOW', 'GTC'), ('FLOW', 'ONDO'),
-              ('SAND', 'SNX'), ('OP', 'SNX'), ('GMT', 'ROSE'), ('CELO', 'SAND')]
+    tokens = [('NEAR', 'ONDO'), ('GOAT', 'MANA'), ('SUSHI', 'XRP'), ('AKT', 'IMX'), ('DOT', 'KSM'),
+              ('PHA', 'ZRX'), ('GOAT', 'ZRX'), ('ARKM', 'ONDO'), ('APT', 'ZEN'), ('AKT', 'CELO'),
+              ('IMX', 'NEAR'), ('FIL', 'ONDO'), ('ONT', 'ZK'), ('C98', 'ONT'), ('CELO', 'ONT'),
+              ('IMX', 'ONT'), ('FLOW', 'ONT'), ('PHA', 'ROSE'), ('APT', 'FIL'), ('PHA', 'XAI'),
+              ('AKT', 'DOT'), ('CHR', 'ONT'), ('GTC', 'OP'), ('PHA', 'STRK'), ('ENJ', 'ONT'),
+              ('ONT', 'STRK'), ('PHA', 'VET'), ('FLOW', 'PHA'), ('MANA', 'ONDO'), ('CHR', 'PHA'),
+              ('ONT', 'ZRX'), ('CHZ', 'STRK'), ('ENJ', 'VET'), ('DYM', 'SAND'), ('GRT', 'VET'),
+              ('ONT', 'SAND'), ('CHR', 'ZRX'), ('IMX', 'IOTA'), ('CHR', 'FLOW'), ('AKT', 'ARKM'),
+              ('BLUR', 'ONT'), ('APT', 'ONDO'), ('PHA', 'SAND'), ('GRT', 'ONT'), ('ARKM', 'ZRX'),
+              ('CELO', 'ONDO'), ('IOTA', 'PHA'), ('GMT', 'ONT'), ('CHZ', 'ONT'), ('AKT', 'NEAR'),
+              ('FIL', 'SNX'), ('IMX', 'SAND'), ('DYM', 'ONT'), ('AKT', 'SNX'), ('CHZ', 'ZK'),
+              ('FIL', 'XRP'), ('IOTA', 'MANA'), ('CELO', 'PHA'), ('IOTA', 'ONT'), ('ARB', 'ONDO'),
+              ('GMT', 'IOTA'), ('DOT', 'ONDO'), ('ENJ', 'STRK'), ('C98', 'CHZ'), ('GALA', 'XAI'),
+              ('ONT', 'XAI'), ('C98', 'ENJ'), ('CELO', 'IOTA'), ('ARKM', 'IOTA'), ('AKT', 'SAND'),
+              ('AKT', 'ZRX'), ('CELO', 'IMX'), ('AKT', 'FIL'), ('ARKM', 'ONT'), ('SAND', 'STRK'),
+              ('CHR', 'ZK'), ('GRT', 'SAND'), ('CHR', 'GRT'), ('DYM', 'IOTA'), ('AKT', 'FLOW'),
+              ('GMT', 'VET'), ('ROSE', 'VET'), ('CHR', 'SAND'), ('ROSE', 'XAI'), ('CHR', 'IOTA'),
+              ('CHR', 'CHZ'), ('DYM', 'PHA'), ('DOT', 'XRP'), ('GMT', 'XAI'), ('DYM', 'ZRX'),
+              ('ROSE', 'STRK'), ('IMX', 'PHA'), ('ENJ', 'ROSE'), ('FLOW', 'SNX'), ('GALA', 'GMT'),
+              ('NEAR', 'SNX'), ('SAND', 'ZRX'), ('FLOW', 'IMX'), ('AKT', 'APT'), ('SNX', 'XRP'),
+              ('GRT', 'IOTA'), ('STRK', 'ZK'), ('FLOW', 'ONDO'), ('DOT', 'FIL'), ('ONT', 'SNX'),
+              ('MANA', 'PHA'), ('GRT', 'XAI'), ('GRT', 'PHA'), ('C98', 'ZK'), ('CHZ', 'ROSE'),
+              ('SAND', 'SNX'), ('DYM', 'XAI'), ('IOTA', 'SAND'), ('IOTA', 'ZRX'), ('IOTA', 'XAI'),
+              ('FLOW', 'GTC'), ('OP', 'SNX'), ('ONDO', 'XRP'), ('CHZ', 'ENJ'), ('CHZ', 'GRT'),
+              ('ARKM', 'IMX'), ('GTC', 'PHA'), ('GMT', 'ROSE'), ('CELO', 'DYM'), ('ARKM', 'MANA'),
+              ('CHZ', 'GALA'), ('DOT', 'ZEN'), ('CELO', 'GRT'), ('VET', 'ZK'), ('IOTA', 'STRK'),
+              ('GTC', 'IOTA'), ('DYM', 'FLOW'), ('ARKM', 'SUSHI'), ('CHR', 'VET'), ('GRT', 'STRK'),
+              ('VET', 'XAI')]
 
 
     for token_1, token_2 in tqdm(tokens):
-        tqdm.write(f'\n===== {token_1} - {token_2} =====')
+        # tqdm.write(f'\n===== {token_1} - {token_2} =====')
         main(token_1, token_2, method, create_df_flag, method_in,
-        start_time, valid_time, end_time, min_trades, n_top_params, leverage,
-        search_type='grid', verbose=0)
+            start_time, valid_time, end_time, min_trades, n_top_params, leverage,
+            search_type='grid', min_order=min_order, verbose=0)
 
     db_manager.close()
