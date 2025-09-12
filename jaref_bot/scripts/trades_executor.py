@@ -32,6 +32,9 @@ def main(demo):
 
     while True:
         try:
+            ct = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(f'Текущее время: {ct}', end='\r')
+
             pairs = postgre_manager.get_table('pairs')
             pending_orders = redis_orders.get_pending_orders()
             pair_tokens_open = pairs['token_1'].to_list() + pairs['token_2'].to_list()
@@ -66,7 +69,7 @@ def main(demo):
         except KeyboardInterrupt:
             print('Завершение работы.')
             break
-        sleep(0.1)
+        sleep(0.25)
 
 
 if __name__ == '__main__':

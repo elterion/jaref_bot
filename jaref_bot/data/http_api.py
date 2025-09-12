@@ -7,7 +7,6 @@ import numpy as np
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone, timedelta
 import logging
-from decimal import Decimal
 import pickle
 
 # Настройка логгирования
@@ -142,11 +141,11 @@ class BybitRestAPI(ExchangeRestAPI):
             if ticker['symbol'].endswith('USDT'):
                 base = ticker['baseCoin']
                 quote = ticker['quoteCoin']
-                min_qty = Decimal(ticker['lotSizeFilter']['minOrderQty'])
+                min_qty = float(ticker['lotSizeFilter']['minOrderQty'])
                 price_scale = int(ticker['priceScale'])
 
                 if self.category == 'linear':
-                    qty_step = Decimal(ticker['lotSizeFilter']['qtyStep'])
+                    qty_step = float(ticker['lotSizeFilter']['qtyStep'])
                     fund_interval = int(ticker['fundingInterval']) // 60
                     instr_data[base+'_'+quote] = {'min_qty': min_qty,
                                                   'qty_step': qty_step,
@@ -154,7 +153,7 @@ class BybitRestAPI(ExchangeRestAPI):
                                                   'fund_interval': fund_interval,
                                                   'price_scale': price_scale}
                 elif self.category == 'spot':
-                    qty_step = Decimal(ticker['lotSizeFilter']['basePrecision'])
+                    qty_step = float(ticker['lotSizeFilter']['basePrecision'])
                     instr_data[base+'_'+quote] = {'min_qty': min_qty,
                                                   'qty_step': qty_step,
                                                   'price_scale': price_scale}
@@ -167,8 +166,8 @@ class BybitRestAPI(ExchangeRestAPI):
         try:
             ask = data['result']['a']
             bid = data['result']['b']
-            res_dic = {'ask': [[Decimal(x[0]), Decimal(x[1])] for x in ask],
-                        'bid': [[Decimal(x[0]), Decimal(x[1])] for x in bid]}
+            res_dic = {'ask': [[float(x[0]), float(x[1])] for x in ask],
+                        'bid': [[float(x[0]), float(x[1])] for x in bid]}
             return res_dic
         except KeyError:
             return {}
@@ -309,9 +308,9 @@ class OKXRestAPI(ExchangeRestAPI):
                 if ticker['instFamily'].endswith('USDT'):
                     base = ticker['ctValCcy']
                     quote = ticker['settleCcy']
-                    ct_val = Decimal(ticker['ctVal'])
-                    min_qty = Decimal(ticker['minSz']) * ct_val
-                    qty_step = Decimal(ticker['lotSz']) * ct_val
+                    ct_val = float(ticker['ctVal'])
+                    min_qty = float(ticker['minSz']) * ct_val
+                    qty_step = float(ticker['lotSz']) * ct_val
                     price_scale = int(len(ticker['tickSz'].split('.')[-1]))
 
                     instr_data[base+'_'+quote] = {'ct_val': ct_val,
@@ -322,8 +321,8 @@ class OKXRestAPI(ExchangeRestAPI):
                 if ticker['instId'].endswith('USDT'):
                     base = ticker['baseCcy']
                     quote = ticker['quoteCcy']
-                    min_qty = Decimal(ticker['minSz'])
-                    qty_step = Decimal(ticker['lotSz'])
+                    min_qty = float(ticker['minSz'])
+                    qty_step = float(ticker['lotSz'])
                     price_scale = int(len(ticker['tickSz'].split('.')[-1]))
 
                     instr_data[base+'_'+quote] = {'min_qty': min_qty,
@@ -338,8 +337,8 @@ class OKXRestAPI(ExchangeRestAPI):
         try:
             ask = data['data'][0]['asks']
             bid = data['data'][0]['bids']
-            res_dic = {'ask': [[Decimal(x[0]), Decimal(x[1])] for x in ask],
-                        'bid': [[Decimal(x[0]), Decimal(x[1])] for x in bid]}
+            res_dic = {'ask': [[float(x[0]), float(x[1])] for x in ask],
+                        'bid': [[float(x[0]), float(x[1])] for x in bid]}
             return res_dic
         except KeyError:
             return {}
@@ -452,7 +451,7 @@ class GateIORestAPI(ExchangeRestAPI):
                 if ticker['id'].endswith('USDT'):
                     base = ticker['base']
                     quote = ticker['quote']
-                    min_qty = Decimal(ticker['min_base_amount'])
+                    min_qty = float(ticker['min_base_amount'])
 
                     prec = int(ticker['amount_precision'])
                     qty_step = round(1 / (10 ** prec), prec)
@@ -464,9 +463,9 @@ class GateIORestAPI(ExchangeRestAPI):
                 if ticker['name'].endswith('USDT'):
                     base = ticker['name'].split('_')[0]
                     quote = ticker['name'].split('_')[-1]
-                    ct_val = Decimal(ticker['quanto_multiplier'])
-                    min_qty = Decimal(ticker['order_size_min']) * ct_val
-                    qty_step = Decimal(ticker['order_size_min']) * ct_val
+                    ct_val = float(ticker['quanto_multiplier'])
+                    min_qty = float(ticker['order_size_min']) * ct_val
+                    qty_step = float(ticker['order_size_min']) * ct_val
                     fund_interval = ticker.get('funding_interval', 0) // 3600
                     next_fund_time = ticker.get('funding_next_apply', 0)
                     nft = datetime.fromtimestamp(next_fund_time).strftime('%Y-%m-%d %H:%M')
@@ -493,13 +492,13 @@ class GateIORestAPI(ExchangeRestAPI):
 
     def _parse_orderbook_data(self, data):
         try:
-            res_dic = {'ask': [[Decimal(x['p']), Decimal(x['s'])] for x in data['asks']],
-                    'bid': [[Decimal(x['p']), Decimal(x['s'])] for x in data['bids']]}
+            res_dic = {'ask': [[float(x['p']), float(x['s'])] for x in data['asks']],
+                    'bid': [[float(x['p']), float(x['s'])] for x in data['bids']]}
 
             return res_dic
         except TypeError:
-            res_dic = {'ask': [[Decimal(x[0]), Decimal(x[1])] for x in data['asks']],
-                    'bid': [[Decimal(x[0]), Decimal(x[1])] for x in data['bids']]}
+            res_dic = {'ask': [[float(x[0]), float(x[1])] for x in data['asks']],
+                    'bid': [[float(x[0]), float(x[1])] for x in data['bids']]}
 
             return res_dic
         except KeyError:

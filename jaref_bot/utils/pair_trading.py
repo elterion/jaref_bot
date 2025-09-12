@@ -3,7 +3,8 @@ import polars_ols as pls
 import numpy as np
 from numba import njit
 
-def make_trunc_df(df, timeframe, token_1, token_2, start_date=None, end_date=None, method="last", offset='0h'):
+def make_trunc_df(df, timeframe, token_1, token_2, start_date=None, end_date=None,
+                  method="last", offset='0h', return_bid_ask=False):
     select_spread = True if 'spread' in df.columns else False
 
     df = df.with_columns(
@@ -12,10 +13,6 @@ def make_trunc_df(df, timeframe, token_1, token_2, start_date=None, end_date=Non
             pl.min_horizontal(f'{token_1}_bid_size', f'{token_1}_ask_size').alias(f'{token_1}_size'),
             pl.min_horizontal(f'{token_2}_bid_size', f'{token_2}_ask_size').alias(f'{token_2}_size')
         )
-    if select_spread:
-        df = df.select('time', 'ts', token_1, token_2, f'{token_1}_size', f'{token_2}_size', 'spread')
-    else:
-        df = df.select('time', 'ts', token_1, token_2, f'{token_1}_size', f'{token_2}_size')
 
     # условия агрегации
     if method == "last":
@@ -44,6 +41,18 @@ def make_trunc_df(df, timeframe, token_1, token_2, start_date=None, end_date=Non
                                pl.col("spread").min()) / 3).alias("spread"))
     else:
         raise ValueError(f"Unknown method: {method}")
+
+    if return_bid_ask:
+        agg_exprs.extend((
+            pl.col(f'{token_1}_bid_price').last(),
+            pl.col(f'{token_1}_ask_price').last(),
+            pl.col(f'{token_2}_bid_price').last(),
+            pl.col(f'{token_2}_ask_price').last(),
+            pl.col(f'{token_1}_bid_size').last(),
+            pl.col(f'{token_1}_ask_size').last(),
+            pl.col(f'{token_2}_bid_size').last(),
+            pl.col(f'{token_2}_ask_size').last()
+        ))
 
     df = df.group_by_dynamic(
                 index_column="time",
@@ -461,7 +470,7 @@ def create_df_loop(
 
     return pos
 
-def create_df(token_1, token_2, df_sec, df_4hour, df_hour,
+def create_zscore_df(token_1, token_2, df_sec, df_4hour, df_hour,
               hour4_winds, hour1_winds, spread_method, min_order):
 
     method_is_lr = 1 if spread_method == 'lr' else 0
@@ -476,6 +485,15 @@ def create_df(token_1, token_2, df_sec, df_4hour, df_hour,
     price1 = df_sec[token_1].to_numpy()
     size2 = df_sec[f'{token_2}_size'].to_numpy()
     price2 = df_sec[token_2].to_numpy()
+    bp1 = df_sec[f'{token_1}_bid_price'].to_numpy()
+    bp2 = df_sec[f'{token_2}_bid_price'].to_numpy()
+    ap1 = df_sec[f'{token_1}_ask_price'].to_numpy()
+    ap2 = df_sec[f'{token_2}_ask_price'].to_numpy()
+
+    bs1 = df_sec[f'{token_1}_bid_size'].to_numpy()
+    bs2 = df_sec[f'{token_2}_bid_size'].to_numpy()
+    as1 = df_sec[f'{token_1}_ask_size'].to_numpy()
+    as2 = df_sec[f'{token_2}_ask_size'].to_numpy()
 
     n = tss.shape[0]
 
@@ -526,6 +544,14 @@ def create_df(token_1, token_2, df_sec, df_4hour, df_hour,
         token_2: t2_buf[:pos],
         f'{token_1}_size': s1_buf[:pos],
         f'{token_2}_size': s2_buf[:pos],
+        f'{token_1}_bid_price': bp1[:pos],
+        f'{token_2}_bid_price': bp2[:pos],
+        f'{token_1}_ask_price': ap1[:pos],
+        f'{token_2}_ask_price': ap2[:pos],
+        f'{token_1}_bid_size': bs1[:pos],
+        f'{token_2}_bid_size': bs2[:pos],
+        f'{token_1}_ask_size': as1[:pos],
+        f'{token_2}_ask_size': as2[:pos]
     }
 
     for i in range(m4):

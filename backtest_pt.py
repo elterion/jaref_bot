@@ -1,6 +1,6 @@
 from jaref_bot.analysis.backtest.pair_trading import backtest
 from jaref_bot.utils.pair_trading import make_df_from_orderbooks, make_trunc_df, get_zscore
-from jaref_bot.utils.pair_trading import create_df
+from jaref_bot.utils.pair_trading import create_zscore_df
 from jaref_bot.analysis.strategy_analysis import analyze_strategy
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -9,6 +9,7 @@ import numpy as np
 from tqdm import tqdm
 import heapq
 from random import choice
+import pickle
 
 from jaref_bot.db.postgres_manager import DBManager
 from jaref_bot.config.credentials import host, user, password, db_name
@@ -16,6 +17,9 @@ db_params = {'host': host, 'user': user, 'password': password, 'dbname': db_name
 db_manager = DBManager(db_params)
 
 from jaref_bot.data.http_api import ExchangeManager, BybitRestAPI
+
+def base(token: str) -> str:
+    return token.split('_')[0] if '_' in token else token
 
 def find_best_params(df, token_1, token_2, dp_1, dp_2, ps_1, ps_2,
                      in_params, out_params,
@@ -175,35 +179,13 @@ def grid_search(token_1, token_2, method, start_time, end_time, min_trades, n_to
     top_params = []
 
     # Загружаем датафрейм с рассчитанным спредом и z_score
-    spread_df = pl.read_parquet(f'./data/pair_backtest/{token_1}_{token_2}_{method}.parquet')
+    spread_df = pl.read_parquet(f'./data/pair_backtest/{token_1}_{token_2}_{method}.parquet').filter(
+        (pl.col('time') >= start_time) & (pl.col('time') < end_time)
+    )
 
-    # Загружаем датафреймы с ценами
-    df_1 = db_manager.get_raw_orderbooks(exchange='bybit',
-                                     market_type='linear',
-                                     token=token_1 + '_USDT',
-                                     start_time=start_time,
-                                     end_time=end_time)
-    df_1 = df_1.with_columns(pl.col('time').dt.epoch('s').alias('ts'))
-    df_2 = db_manager.get_raw_orderbooks(exchange='bybit',
-                                        market_type='linear',
-                                        token=token_2 + '_USDT',
-                                        start_time=start_time,
-                                        end_time=end_time)
-    df_2 = df_2.with_columns(pl.col('time').dt.epoch('s').alias('ts'))
-
-    bid_ask_df = make_df_from_orderbooks(df_1, df_2, token_1, token_2,
-                                         start_time, end_time,
-                                         return_spread=True, log_spread=True)
-    bid_ask_df = bid_ask_df.select('ts', f'{token_1}_bid_price',
-                                f'{token_1}_ask_price',
-                                f'{token_2}_bid_price',
-                                f'{token_2}_ask_price'
-                                )
-
-    # Загружаем с биржи ByBit техническую информацию по монетам (шаг цены, округление цены в usdt etc.)
-    exc_manager = ExchangeManager()
-    exc_manager.add_market("bybit_linear", BybitRestAPI('linear'))
-    coin_information = exc_manager.get_instrument_data()
+    # Загружаем техническую информацию по монетам (шаг цены, округление цены в usdt etc.)
+    with open("./data/coin_information.pkl", "rb") as f:
+        coin_information = pickle.load(f)
 
     # Сохраним информацию о шаге цены монет в переменных
     dp_1 = float(coin_information['bybit_linear'][token_1 + '_USDT']['qty_step'])
@@ -216,9 +198,11 @@ def grid_search(token_1, token_2, method, start_time, end_time, min_trades, n_to
             print(f'Параметры модели. tf: {tf}, wind: {wind}')
 
         try:
-            df = spread_df.select('time', 'ts', f'z_score_{wind}_{tf}')
+            df = spread_df.select('time', 'ts', token_1, token_2, f'{token_1}_size', f'{token_2}_size',
+                 f'{token_1}_bid_price', f'{token_1}_ask_price', f'{token_1}_bid_size', f'{token_1}_ask_size',
+                 f'{token_2}_bid_price', f'{token_2}_ask_price', f'{token_2}_bid_size', f'{token_2}_ask_size',
+                 f'z_score_{wind}_{tf}')
             df = df.rename({f'z_score_{wind}_{tf}': 'z_score'})
-            df = df.join(bid_ask_df, on='ts')
         except pl.exceptions.ColumnNotFoundError:
             print('Нет такого временного окна в датафрейме\n')
             continue
@@ -245,6 +229,8 @@ def grid_search(token_1, token_2, method, start_time, end_time, min_trades, n_to
     for p in top_params:
         tqdm.write(f'({p[0]:.2f}, "{token_1}", "{token_2}", "{p[2]}", {p[3]}, {p[4]}, {p[5]})')
 
+    return top_params
+
 def create_data(token_1, token_2, method, start_time, valid_time,
               hour4_winds, hour1_winds, min_order, write_to_file=True):
     if method == 'lr':
@@ -266,9 +252,9 @@ def create_data(token_1, token_2, method, start_time, valid_time,
     df_hour = make_trunc_df(df, timeframe='1h', token_1=token_1, token_2=token_2, method='triple')
     df_4hour = make_trunc_df(df, timeframe='4h', token_1=token_1, token_2=token_2, method='triple')
     df_sec = make_trunc_df(df, timeframe='1s', token_1=token_1, token_2=token_2,
-                           start_date=valid_time, method='last')
+                           start_date=valid_time, method='last', return_bid_ask=True)
 
-    res_df = create_df(token_1, token_2, df_sec, df_4hour, df_hour, hour4_winds, hour1_winds, method, min_order)
+    res_df = create_zscore_df(token_1, token_2, df_sec, df_4hour, df_hour, hour4_winds, hour1_winds, method, min_order)
     if write_to_file:
         res_df.write_parquet(f'./data/pair_backtest/{token_1}_{token_2}_{method}.parquet')
 
@@ -276,10 +262,10 @@ def create_data(token_1, token_2, method, start_time, valid_time,
 
 def main(token_1, token_2, method, create_df_flag, method_in,
          start_time, valid_time, end_time, min_trades, n_top_params, leverage,
-         search_type='grid', min_order=50, n_iters=100_000, verbose=0):
+         search_type='grid', min_order=50, n_iters=100_000, verbose=0, save_to_file=False):
 
     hour4_winds = np.array([8, 10, 12, 14, 16, 18])
-    hour1_winds = np.array([12, 18, 24, 32])
+    hour1_winds = np.array([12, 18, 24, 32, 40, 48])
 
     # Создадим датафрейм с z_score
     if create_df_flag:
@@ -293,7 +279,7 @@ def main(token_1, token_2, method, create_df_flag, method_in,
     out_params = (0.25, )
 
     if search_type == 'grid':
-        grid_search(token_1, token_2, method, valid_time, end_time, min_trades, n_top_params,
+        top_params = grid_search(token_1, token_2, method, valid_time, end_time, min_trades, n_top_params,
             search_space, method_in, in_params, out_params,
             leverage, verbose=verbose)
     elif search_type == 'random':
@@ -301,14 +287,19 @@ def main(token_1, token_2, method, create_df_flag, method_in,
             search_space, in_params, out_params,
             leverage, n_iters=n_iters, verbose=verbose)
 
+    if save_to_file:
+        with open('./jaref_bot/config/thresholds.txt', 'w') as file:
+            for p in top_params:
+                file.write(f'({p[0]:.2f}, "{p[1]}", "{p[2]}", "{p[3]}", {p[4]}, {p[5]}, {p[6]})\n')
+
 if __name__ == '__main__':
     create_df_flag = True
     method = 'lr'
-    valid_length = 1
+    valid_length = 3
     train_length = 6
 
-    end_time = datetime.now(ZoneInfo("Europe/Moscow"))
-    # end_time = datetime(2025, 9, 8, 12, 40, 15, tzinfo=ZoneInfo("Europe/Moscow"))
+    # end_time = datetime.now(ZoneInfo("Europe/Moscow"))
+    end_time = datetime(2025, 9, 12, 23, 30, 0, tzinfo=ZoneInfo("Europe/Moscow"))
     valid_time = (end_time - timedelta(days=valid_length)).replace(
         hour=0, minute=0, second=0, microsecond=0)
     start_time = valid_time - timedelta(days=train_length)
@@ -320,40 +311,31 @@ if __name__ == '__main__':
 
     method_in = 'direct'
 
-    tokens = [('NEAR', 'ONDO'), ('GOAT', 'MANA'), ('SUSHI', 'XRP'), ('AKT', 'IMX'), ('DOT', 'KSM'),
-              ('PHA', 'ZRX'), ('GOAT', 'ZRX'), ('ARKM', 'ONDO'), ('APT', 'ZEN'), ('AKT', 'CELO'),
-              ('IMX', 'NEAR'), ('FIL', 'ONDO'), ('ONT', 'ZK'), ('C98', 'ONT'), ('CELO', 'ONT'),
-              ('IMX', 'ONT'), ('FLOW', 'ONT'), ('PHA', 'ROSE'), ('APT', 'FIL'), ('PHA', 'XAI'),
-              ('AKT', 'DOT'), ('CHR', 'ONT'), ('GTC', 'OP'), ('PHA', 'STRK'), ('ENJ', 'ONT'),
-              ('ONT', 'STRK'), ('PHA', 'VET'), ('FLOW', 'PHA'), ('MANA', 'ONDO'), ('CHR', 'PHA'),
-              ('ONT', 'ZRX'), ('CHZ', 'STRK'), ('ENJ', 'VET'), ('DYM', 'SAND'), ('GRT', 'VET'),
-              ('ONT', 'SAND'), ('CHR', 'ZRX'), ('IMX', 'IOTA'), ('CHR', 'FLOW'), ('AKT', 'ARKM'),
-              ('BLUR', 'ONT'), ('APT', 'ONDO'), ('PHA', 'SAND'), ('GRT', 'ONT'), ('ARKM', 'ZRX'),
-              ('CELO', 'ONDO'), ('IOTA', 'PHA'), ('GMT', 'ONT'), ('CHZ', 'ONT'), ('AKT', 'NEAR'),
-              ('FIL', 'SNX'), ('IMX', 'SAND'), ('DYM', 'ONT'), ('AKT', 'SNX'), ('CHZ', 'ZK'),
-              ('FIL', 'XRP'), ('IOTA', 'MANA'), ('CELO', 'PHA'), ('IOTA', 'ONT'), ('ARB', 'ONDO'),
-              ('GMT', 'IOTA'), ('DOT', 'ONDO'), ('ENJ', 'STRK'), ('C98', 'CHZ'), ('GALA', 'XAI'),
-              ('ONT', 'XAI'), ('C98', 'ENJ'), ('CELO', 'IOTA'), ('ARKM', 'IOTA'), ('AKT', 'SAND'),
-              ('AKT', 'ZRX'), ('CELO', 'IMX'), ('AKT', 'FIL'), ('ARKM', 'ONT'), ('SAND', 'STRK'),
-              ('CHR', 'ZK'), ('GRT', 'SAND'), ('CHR', 'GRT'), ('DYM', 'IOTA'), ('AKT', 'FLOW'),
-              ('GMT', 'VET'), ('ROSE', 'VET'), ('CHR', 'SAND'), ('ROSE', 'XAI'), ('CHR', 'IOTA'),
-              ('CHR', 'CHZ'), ('DYM', 'PHA'), ('DOT', 'XRP'), ('GMT', 'XAI'), ('DYM', 'ZRX'),
-              ('ROSE', 'STRK'), ('IMX', 'PHA'), ('ENJ', 'ROSE'), ('FLOW', 'SNX'), ('GALA', 'GMT'),
-              ('NEAR', 'SNX'), ('SAND', 'ZRX'), ('FLOW', 'IMX'), ('AKT', 'APT'), ('SNX', 'XRP'),
-              ('GRT', 'IOTA'), ('STRK', 'ZK'), ('FLOW', 'ONDO'), ('DOT', 'FIL'), ('ONT', 'SNX'),
-              ('MANA', 'PHA'), ('GRT', 'XAI'), ('GRT', 'PHA'), ('C98', 'ZK'), ('CHZ', 'ROSE'),
-              ('SAND', 'SNX'), ('DYM', 'XAI'), ('IOTA', 'SAND'), ('IOTA', 'ZRX'), ('IOTA', 'XAI'),
-              ('FLOW', 'GTC'), ('OP', 'SNX'), ('ONDO', 'XRP'), ('CHZ', 'ENJ'), ('CHZ', 'GRT'),
-              ('ARKM', 'IMX'), ('GTC', 'PHA'), ('GMT', 'ROSE'), ('CELO', 'DYM'), ('ARKM', 'MANA'),
-              ('CHZ', 'GALA'), ('DOT', 'ZEN'), ('CELO', 'GRT'), ('VET', 'ZK'), ('IOTA', 'STRK'),
-              ('GTC', 'IOTA'), ('DYM', 'FLOW'), ('ARKM', 'SUSHI'), ('CHR', 'VET'), ('GRT', 'STRK'),
-              ('VET', 'XAI')]
+    cointegrated_tokens = []
+    with open('./jaref_bot/config/cointegrated_tokens.txt', 'r') as file:
+        for line in file:
+            a, b = line.strip().split()
+            cointegrated_tokens.append((a, b))
+
+    # --- Проверка того, все ли открытые позиции есть в cointegrated_tokens ---
+    current_pairs = db_manager.get_table('pairs', df_type='polars')
+    cointegrated_set_base = set((a, b) for a, b in cointegrated_tokens)
+
+    missing_pairs = [
+        (base(r['token_1']), base(r['token_2']))
+        for r in current_pairs.to_dicts()
+        if (base(r['token_1']), base(r['token_2'])) not in cointegrated_set_base
+    ]
+
+    for pair in missing_pairs:
+        cointegrated_tokens.append(pair)
 
 
-    for token_1, token_2 in tqdm(tokens):
+    # --- Бектест по всем коинтегрированным парам токенов ---
+    for token_1, token_2 in tqdm(cointegrated_tokens):
         # tqdm.write(f'\n===== {token_1} - {token_2} =====')
         main(token_1, token_2, method, create_df_flag, method_in,
             start_time, valid_time, end_time, min_trades, n_top_params, leverage,
-            search_type='grid', min_order=min_order, verbose=0)
+            search_type='grid', min_order=min_order, verbose=0, save_to_file=True)
 
     db_manager.close()

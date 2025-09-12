@@ -229,6 +229,26 @@ class DBManager:
         with self.conn.cursor() as cur:
             cur.execute(query, (token_1, token_2))
 
+    def add_data_to_zscore_history(self, data):
+        """
+        Добавляет список записей в таблицу
+        data: список кортежей в формате (ts, exchange, token_1, token_2, z_score, profit)
+        """
+        with self.conn.cursor() as cur:
+            # Преобразуем данные в нужный формат
+            records = [
+                (ts, exchange, token_1, token_2, profit, z_score)
+                for (ts, exchange, token_1, token_2, profit, z_score) in data
+            ]
+
+            # Выполняем массовую вставку
+            cur.executemany(
+                "INSERT INTO zscore_history (ts, exchange, token_1, token_2, profit, z_score) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                records
+            )
+
+
 
     def close_order(self, token, exchange, market_type, qty, close_price, close_usdt_amount, close_fee, closed_at=None):
         """

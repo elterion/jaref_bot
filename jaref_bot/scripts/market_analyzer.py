@@ -186,6 +186,22 @@ def get_hist_df(postgre_manager, start_time):
 
     return hour_4_df, hour_1_df
 
+def calculate_profit(open_price, close_price, n_coins=None, usdt_amount=None, side='long', fee_rate=0.00055):
+    if n_coins is None:
+        n_coins = round(usdt_amount / open_price)
+
+    usdt_open = n_coins * open_price
+    open_fee = usdt_open * fee_rate
+
+    usdt_close = n_coins * close_price
+    close_fee = usdt_close * fee_rate
+
+    if side == 'long':
+        profit = usdt_close - usdt_open - open_fee - close_fee
+    elif side == 'short':
+        profit = usdt_open - usdt_close - open_fee - close_fee
+    return profit
+
 @lru_cache
 def set_leverage_cached(token, leverage):
     set_leverage(demo=demo, exc='bybit_linear', symbol=token + '_USDT', leverage=leverage)
@@ -223,9 +239,12 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
     print(f'{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Старт основного цикла.')
     while True:
         try:
+            zscore_arr = []
+
             time_now = datetime.now()
             ts = int(datetime.timestamp(time_now))
             ct = time_now.strftime('%Y-%m-%d %H:%M:%S')
+            print(f'Текущее время: {ct}', end='\r')
 
             # --- Подгружаем исторические датафреймы 1 раз в час ---
             try:
@@ -237,11 +256,15 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
             if last_updates_1h > 3665: # 1 час 1 минута 5 секунд
                 hour_4_df, hour_1_df = get_hist_df(postgre_manager, start_time)
 
+                # Обновляем 1 раз в час пороги входа/выхода на случай, если они изменились
+                params = get_thresholds()
+                token_params = sorted(params, key=lambda x: x[0], reverse=True)
+
             # --- Текущие данные ---
             current_data = redis_orderbooks.get_orderbooks(1)
             if current_data.is_empty():
                 print(f'{ct} current data is empty!')
-                sleep(5)
+                sleep(10)
                 continue
 
             current_data = current_data.with_columns(
@@ -267,15 +290,18 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
             for _, t1_name, t2_name, tf, wind, thresh_in, thresh_out in token_params:
                 token_1 = t1_name + '_USDT'
                 token_2 = t2_name + '_USDT'
+                t1_med_price = None
+                t2_med_price = None
+                z_score = 0
 
-                low_in = -1.8
+                low_in = -2.0
                 low_out = -0.5
-                high_in = 1.8
+                high_in = 2.0
                 high_out = 0.5
 
                 # --- Получаем информацию о кол-ве знаков после запятой в цене токена для округления цен ---
-                dp_1 = coin_information['bybit_linear'][token_1]['price_scale']
-                dp_2 = coin_information['bybit_linear'][token_2]['price_scale']
+                # dp_1 = coin_information['bybit_linear'][token_1]['price_scale']
+                # dp_2 = coin_information['bybit_linear'][token_2]['price_scale']
 
                 # --- Обновляем открытые пары и текущие ордеры
                 if update_positions_flag:
@@ -296,10 +322,14 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
                 t2_curr_data = current_data.filter(pl.col('symbol') == token_2)
 
                 # --- Проверка на актуальность текущих цен ---
-                t1_ts = t1_curr_data['ts'].item()
-                t2_ts = t2_curr_data['ts'].item()
+                try:
+                    t1_ts = t1_curr_data['ts'].item()
+                    t2_ts = t2_curr_data['ts'].item()
+                except ValueError: # Ситуация, когда после восстановления соединения не все токены успевают обновиться
+                    sleep(5)
+                    break
 
-                if abs(t1_ts - t2_ts) > 5: # Если разница во времени между двумя ценами больше 5 секунд, пропускаем эту пару
+                if abs(t1_ts - t2_ts) > 10: # Если разница во времени между двумя ценами больше 10 секунд, пропускаем эту пару
                     continue
 
                 # Вместо текущей цены подставляем в функцию для расчёта z_score медианную цену за 5 секунд, чтобы избежать выбросов
@@ -309,14 +339,13 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
                 if t1_df_sec.height >= 3 and t2_df_sec.height >= 3:
                     t1_med_price = t1_df_sec['avg_price'].median()
                     t2_med_price = t2_df_sec['avg_price'].median()
+                    t1 = token_1_hist_price.append(pl.Series("avg_price", [t1_med_price])).to_numpy()
+                    t2 = token_2_hist_price.append(pl.Series("avg_price", [t2_med_price])).to_numpy()
+
+                    alpha, beta, zscore = get_lr_zscore(t1, t2, np.array([wind]))
+                    z_score = zscore[0]
                 else:
                     continue
-
-                t1 = token_1_hist_price.append(pl.Series("avg_price", [t1_med_price])).to_numpy()
-                t2 = token_2_hist_price.append(pl.Series("avg_price", [t2_med_price])).to_numpy()
-
-                alpha, beta, zscore = get_lr_zscore(t1, t2, np.array([wind]))
-                z_score = zscore[0]
 
                 # ----- Проверяем условия для входа в позицию -----
                 if open_new_orders and pairs.height < max_pairs:
@@ -354,9 +383,29 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
                 if first_leg.is_empty() or second_leg.is_empty(): # Если данные не успели обновиться
                     continue
 
-                long_opened =  pairs.filter((pl.col('token_1') == token_1) & (pl.col('token_2') == token_2) & (pl.col('side') == 'long')).height == 1
-                short_opened =  pairs.filter((pl.col('token_1') == token_1) & (pl.col('token_2') == token_2) & (pl.col('side') == 'short')).height == 1
+                long_opened =  pairs.filter(
+                        (pl.col('token_1') == token_1) & (pl.col('token_2') == token_2) & (pl.col('side') == 'long')
+                    ).height == 1
+                short_opened =  pairs.filter(
+                        (pl.col('token_1') == token_1) & (pl.col('token_2') == token_2) & (pl.col('side') == 'short')
+                    ).height == 1
 
+                # --- Добавляем текущий z_score и profit в таблицу БД ---
+                if long_opened or short_opened:
+                    t1_op = first_leg['price'][0]
+                    t2_op = second_leg['price'][0]
+                    q1 = first_leg['qty'][0]
+                    q2 = second_leg['qty'][0]
+
+                    side_1 = 'long' if long_opened else 'short'
+                    side_2 = 'short' if long_opened else 'long'
+
+                    curr_profit_1 = calculate_profit(open_price=t1_op, close_price=t1_med_price, n_coins=q1, side=side_1)
+                    curr_profit_2 = calculate_profit(open_price=t2_op, close_price=t2_med_price, n_coins=q2, side=side_2)
+                    curr_profit = curr_profit_1 + curr_profit_2
+                    zscore_arr.append((ts, 'bybit', token_1, token_2, curr_profit, z_score))
+
+                # --- Выходим из позиции, если позволяют условия ---
                 if zscore > high_out and long_opened:
                     change_position(token_1, token_2, pos_side='close', t1_orig_side='long', t2_orig_side='short',
                         t1_data=t1_curr_data, t2_data=t2_curr_data, t1_usdt_amount=None, t2_usdt_amount=None,
@@ -373,15 +422,24 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
                     update_positions_flag = True
                     break
 
-            sleep(0.5)
+            try:
+                postgre_manager.add_data_to_zscore_history(zscore_arr)
+            except Exception as err:
+                print(zscore_arr)
+                print(err)
+                break
+            sleep(0.9)
 
         except KeyboardInterrupt:
-            print('Завершение работы.')
+            print('\nЗавершение работы.')
             break
 
 
 if __name__ == '__main__':
-    demo=True
+    demo = True
+    open_new_orders = True # Открывать новые позиции или только закрываем уже существующие
+
+
     exchange = 'bybit'
     min_order = 50     # Минимальный размер ордера
     max_position = 100 # Максимальный размер одного плеча в парной позиции
@@ -390,6 +448,5 @@ if __name__ == '__main__':
     fee_rate = 0.00055 # Процент комиссии биржи
     td = 120           # За сколько последних часов брать историю
 
-    open_new_orders = True # Открывать новые позиции или только закрываем уже существующие
 
     main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fee_rate, td)
