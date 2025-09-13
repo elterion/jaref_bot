@@ -10,10 +10,10 @@ import pandas as pd
 import polars as pl
 import numpy as np
 from datetime import datetime
-from time import sleep, time
-from decimal import Decimal, ROUND_DOWN
+from time import sleep
 import pickle
 import ast
+import json
 
 from zoneinfo import ZoneInfo
 from datetime import timedelta
@@ -206,6 +206,55 @@ def calculate_profit(open_price, close_price, n_coins=None, usdt_amount=None, si
 def set_leverage_cached(token, leverage):
     set_leverage(demo=demo, exc='bybit_linear', symbol=token + '_USDT', leverage=leverage)
 
+def write_order_log(ts, ct, token_1, token_2, tf, wind, side, action, t1, t2, t1_df_sec, t2_df_sec, t1_med_price, t2_med_price, z_score):
+    """
+    Запись сделки в лог файл.
+    ts - unix timestamp
+    ct - текущее время в формате datetime
+    token_1 - название токена_1
+    token_2 - название токена_2
+    tf - таймфрейм
+    wind - размер скользящего окна
+    t1 - исторические данные для токена_1
+    t2 - исторические данные для токена_2
+    t1_df_sec - датафрейм с последними записями токена_1
+    t2_df_sec - датафрейм с последними записями токена_1
+    t1_med_price - медианная цена токена_1
+    t2_med_price - медианная цена токена_2
+    z_score - z_score
+
+    На выходе ключи словаря t1_last и t2_last являются последними ценами
+    токенов, взятыми из t1_df_sec и t2_df_sec.
+
+    """
+
+
+    t1 = [round(x, 6) for x in t1.tolist()]
+    t2 = [round(x, 6) for x in t2.tolist()]
+    t1_last = [round(x, 6) for x in t1_df_sec['avg_price'].to_list()]
+    t2_last = [round(x, 6) for x in t2_df_sec['avg_price'].to_list()]
+    z_score = round(float(z_score), 2)
+
+    log = {'ts': ts,
+            'ct': ct,
+            'token_1': token_1,
+            'token_2': token_2,
+            'tf': tf,
+            'wind': wind,
+            'side': side,
+            'action': action,
+            't1': t1,
+            't2': t2,
+            't1_last': t1_last,
+            't2_last': t2_last,
+            't1_med_price': round(t1_med_price, 6),
+            't2_med_price': round(t2_med_price, 6),
+            'z_score': z_score
+           }
+    json_log = json.dumps(log, default=float, ensure_ascii=False)
+
+    with open('./logs/trades.jsonl', 'a', encoding='utf-8') as f:
+        f.write(json_log + '\n')
 
 def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fee_rate, td):
     update_positions_flag = False
@@ -364,6 +413,11 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
                                 z_score=z_score, coin_information=coin_information,
                                 db_manager=postgre_manager, redis_manager=redis_orders)
                             update_positions_flag = True
+
+                            side = 'long'
+                            action = 'open'
+                            write_order_log(ts, ct, token_1, token_2, tf, wind, side, action,
+                                            t1, t2, t1_df_sec, t2_df_sec, t1_med_price, t2_med_price, z_score)
                             break
 
                         # Проверяем открытие short-позиции по token_1 и long-позиции по token_2
@@ -374,6 +428,11 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
                                 z_score=z_score, coin_information=coin_information,
                                 db_manager=postgre_manager, redis_manager=redis_orders)
                             update_positions_flag = True
+
+                            side = 'short'
+                            action = 'open'
+                            write_order_log(ts, ct, token_1, token_2, tf, wind, side, action,
+                                            t1, t2, t1_df_sec, t2_df_sec, t1_med_price, t2_med_price, z_score)
                             break
 
                 # ----- Проверяем условия выхода из позиции -----
@@ -412,6 +471,11 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
                         leverage=leverage, min_order=min_order, fee_rate=fee_rate, ts=ts, z_score=z_score,
                         coin_information=coin_information, db_manager=postgre_manager, redis_manager=redis_orders)
                     update_positions_flag = True
+
+                    side = 'long'
+                    action = 'close'
+                    write_order_log(ts, ct, token_1, token_2, tf, wind, side, action,
+                                    t1, t2, t1_df_sec, t2_df_sec, t1_med_price, t2_med_price, z_score)
                     break
 
                 if zscore < low_out and short_opened:
@@ -420,6 +484,11 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
                         leverage=leverage, min_order=min_order, fee_rate=fee_rate, ts=ts, z_score=z_score,
                         coin_information=coin_information, db_manager=postgre_manager, redis_manager=redis_orders)
                     update_positions_flag = True
+
+                    side = 'short'
+                    action = 'close'
+                    write_order_log(ts, ct, token_1, token_2, tf, wind, side, action,
+                                    t1, t2, t1_df_sec, t2_df_sec, t1_med_price, t2_med_price, z_score)
                     break
 
             try:
