@@ -2,6 +2,12 @@ import polars as pl
 import polars_ols as pls
 import numpy as np
 from numba import njit
+from jaref_bot.utils.coins import get_step_info
+import math
+import ast
+
+def round_down(value: float, dp: float):
+    return round(math.floor(value / dp) * dp, 6)
 
 def make_trunc_df(df, timeframe, token_1, token_2, start_date=None, end_date=None,
                   method="last", offset='0h', return_bid_ask=False):
@@ -69,7 +75,7 @@ def make_trunc_df(df, timeframe, token_1, token_2, start_date=None, end_date=Non
 
 def make_df_from_orderbooks(df_1, df_2, token_1, token_2,
                             start_time=None, end_time=None,
-                            return_spread=True, log_spread=True):
+                            return_spread=False, log_spread=False):
     """
     Функция на вход принимает 2 датафрейма с ордербуками, усредняет цены покупки/продажи
     и возвращает новый датафрейм с рассчитанным спредом.
@@ -337,31 +343,9 @@ def binary_search_left(arr, x):
             hi = mid
     return lo
 
-@njit
-def median_small(src, length):
-    """Медиана для маленького массива length<=6: простая сортировка вставками."""
-    # копируем в маленький массив
-    tmp = np.empty(length, dtype=np.float64)
-    for i in range(length):
-        tmp[i] = src[i]
-    # insertion sort
-    for i in range(1, length):
-        key = tmp[i]
-        j = i - 1
-        while j >= 0 and tmp[j] > key:
-            tmp[j+1] = tmp[j]
-            j -= 1
-        tmp[j+1] = key
-    # медиана
-    if length == 0:
-        return np.nan
-    if (length % 2) == 1:
-        return tmp[length // 2]
-    else:
-        return 0.5 * (tmp[length//2 - 1] + tmp[length//2])
 
 @njit
-def create_df_loop(
+def create_2df_loop(
     nrows,
     sec_ts, sec_t1, sec_t2, sec_s1, sec_s2,
     hour4_ts, hour4_t1, hour4_t2, max_hour4_wind,
@@ -406,8 +390,8 @@ def create_df_loop(
             t1_med = cur_t1
             t2_med = cur_t2
         else:
-            t1_med = median_small(tmp_last6_t1, sel_cnt)
-            t2_med = median_small(tmp_last6_t2, sel_cnt)
+            t1_med = np.median(tmp_last6_t1)
+            t2_med = np.median(tmp_last6_t2)
 
         # 3) hour4_stat: взять записи hour4_ts < cur_ts и хвост длины max_hour4_wind
         idx4 = binary_search_left(hour4_ts, cur_ts)
@@ -470,7 +454,88 @@ def create_df_loop(
 
     return pos
 
-def create_zscore_df(token_1, token_2, df_sec, df_4hour, df_hour,
+@njit
+def create_1df_loop(
+    nrows,
+    sec_ts, sec_t1, sec_t2, sec_s1, sec_s2,
+    hour1_ts, hour1_t1, hour1_t2, max_hour1_wind,
+    min_order, hour1_winds,
+    ts_buf, t1_buf, t2_buf, s1_buf, s2_buf,
+    beta1_buf, z1_buf
+):
+    pos = 0
+    # временные массивы (максимальный размер для окон + 1)
+    tmp_win1_t1 = np.empty(max_hour1_wind + 1, dtype=np.float64)
+    tmp_win1_t2 = np.empty(max_hour1_wind + 1, dtype=np.float64)
+    tmp_last6_t1 = np.empty(6, dtype=np.float64)
+    tmp_last6_t2 = np.empty(6, dtype=np.float64)
+
+    for i in range(nrows):
+        # 1) базовые поля из sec arrays
+        cur_ts = sec_ts[i]
+        cur_t1 = sec_t1[i]
+        cur_t2 = sec_t2[i]
+        cur_s1 = sec_s1[i]
+        cur_s2 = sec_s2[i]
+
+        # 2) последние 6 строк и медиана (фильтр по объёму)
+        start6 = i - 6
+        if start6 < 0:
+            start6 = 0
+        end6 = i
+        sel_cnt = 0
+        for j in range(start6, end6):
+            vol1 = sec_s1[j] * sec_t1[j]
+            vol2 = sec_s2[j] * sec_t2[j]
+            if (vol1 > min_order) and (vol2 > min_order):
+                tmp_last6_t1[sel_cnt] = sec_t1[j]
+                tmp_last6_t2[sel_cnt] = sec_t2[j]
+                sel_cnt += 1
+
+        if sel_cnt == 0:
+            t1_med = cur_t1
+            t2_med = cur_t2
+        else:
+            t1_med = np.median(tmp_last6_t1)
+            t2_med = np.median(tmp_last6_t2)
+
+        # 4) hour1_stat аналогично
+        idx1 = binary_search_left(hour1_ts, cur_ts)
+        start1 = idx1 - max_hour1_wind
+        if start1 < 0:
+            start1 = 0
+        len1 = idx1 - start1
+        for j in range(len1):
+            tmp_win1_t1[j] = hour1_t1[start1 + j]
+            tmp_win1_t2[j] = hour1_t2[start1 + j]
+        tmp_win1_t1[len1] = t1_med
+        tmp_win1_t2[len1] = t2_med
+        total1_len = len1 + 1
+
+        small1_t1 = np.empty(total1_len, dtype=np.float64)
+        small1_t2 = np.empty(total1_len, dtype=np.float64)
+        for j in range(total1_len):
+            small1_t1[j] = tmp_win1_t1[j]
+            small1_t2[j] = tmp_win1_t2[j]
+
+        alpha1, beta1_vals, z1_vals = get_lr_zscore(small1_t1, small1_t2, hour1_winds)
+
+        # 6) Записываем все в буферы
+        ts_buf[pos] = cur_ts
+        t1_buf[pos] = cur_t1
+        t2_buf[pos] = cur_t2
+        s1_buf[pos] = cur_s1
+        s2_buf[pos] = cur_s2
+
+        # beta4/z4 для всех окон
+        for k in range(beta1_vals.shape[0]):
+            beta1_buf[pos, k] = beta1_vals[k]
+            z1_buf[pos, k] = z1_vals[k]
+        pos += 1
+
+    return pos
+
+def create_zscore_2df(token_1, token_2, df_sec, df_4hour, df_hour,
               hour4_winds, hour1_winds, spread_method, min_order):
 
     method_is_lr = 1 if spread_method == 'lr' else 0
@@ -525,7 +590,7 @@ def create_zscore_df(token_1, token_2, df_sec, df_4hour, df_hour,
     beta1_buf = np.full((n, m1), np.nan, dtype=np.float64)
     z1_buf = np.full((n, m1), np.nan, dtype=np.float64)
 
-    pos = create_df_loop(
+    pos = create_2df_loop(
         n,
         tss, price1, price2, size1, size2,
         hour4_ts, hour4_t1, hour4_t2, max_hour4_wind,
@@ -567,3 +632,199 @@ def create_zscore_df(token_1, token_2, df_sec, df_4hour, df_hour,
                 ).with_columns(
                     pl.col('time').dt.convert_time_zone('Europe/Moscow')
                 )
+
+@njit
+def create_zscore_curve(start_ts: int,
+                        median_length: int,
+                        tss: np.ndarray,
+                        price1: np.ndarray,
+                        price2: np.ndarray,
+                        size1: np.ndarray,
+                        size2: np.ndarray,
+                        hist_ts: np.ndarray,
+                        hist_t1: np.ndarray,
+                        hist_t2: np.ndarray,
+                        winds: np.ndarray,
+                        min_order: float):
+    """
+    Функция на исторических данных рассчитывает z_score для каждой строки.
+
+    Args:
+        start_ts: unix timestamp начала бектеста
+        median_length: количество секунд для вычисления медианы
+        tss: массив, состоящий из unix timestamp, для каждой строки секундного датафрейма
+        price1: массив из цен для токена_1
+        price2: массив из цен для токена_2
+        size1: массив из доступных объёмов для токена_1
+        size2: массив из доступных объёмов для токена_2
+        hist_ts: массив из unix timestamp для каждой строки датафрейма с агрегированными данными
+        hist_t1: массив из цен для токена_1 из датафрейма с агрегированными данными
+        hist_t2: массив из цен для токена_2 из датафрейма с агрегированными данными
+        winds: массив из размеров окон
+        min_order: размер минимального ордера в usdt для фильтрации слишком малого объёма
+
+    """
+    nrows = tss.shape[0]
+    ts_arr = np.full(nrows, np.nan)
+    z_score_arr = np.full(nrows, np.nan)
+
+    for i in range(nrows):
+        # Пропускаем начало датафрейма, нужное для вычисления медианы
+        if tss[i] <= start_ts:
+            continue
+
+        t1_price = price1[i - median_length: i]
+        t2_price = price2[i - median_length: i]
+        t1_size = size1[i - median_length: i]
+        t2_size = size2[i - median_length: i]
+
+        if np.sum(t1_price * t1_size > min_order) < 3 or np.sum(t2_price * t2_size > min_order) < 3:
+            continue
+
+        t1_med = np.median(t1_price)
+        t2_med = np.median(t2_price)
+
+        # Выберем из агрегированных цен только те, которые были до текущего момента
+        n_elems = hist_ts[hist_ts < tss[i]][:-1].shape[0]
+        tail = hist_ts.shape[0] - n_elems
+        t1_hist = hist_t1[:-tail]
+        t2_hist = hist_t2[:-tail]
+
+        # Сформируем массивы, в которых к историческим данным в конец добавим текущую медианную цену, и посчитаем z_score
+        t1_arr_med = np.append(t1_hist, t1_med)
+        t2_arr_med = np.append(t2_hist, t2_med)
+        _, beta_med, zscore_med = get_lr_zscore(t1_arr_med, t2_arr_med, winds)
+
+        ts_arr[i] = tss[i]
+        z_score_arr[i] = zscore_med[0]
+
+    return ts_arr[~np.isnan(ts_arr)].astype(np.int64), z_score_arr[~np.isnan(z_score_arr)]
+
+def create_zscore_df(token_1, token_2, df_sec, agg_df, winds, min_order, start_ts, median_length):
+
+    # method_is_lr = 1 if spread_method == 'lr' else 0
+
+    # --- Перевод polars в numpy ---
+    tss = df_sec['ts'].to_numpy()
+    size1 = df_sec[f'{token_1}_size'].to_numpy()   # np.ndarray, shape (n,)
+    price1 = df_sec[token_1].to_numpy()
+    size2 = df_sec[f'{token_2}_size'].to_numpy()
+    price2 = df_sec[token_2].to_numpy()
+
+    hist_ts = agg_df['ts'].to_numpy()
+    hist_t1 = agg_df[token_1].to_numpy()
+    hist_t2 = agg_df[token_2].to_numpy()
+
+    # --- Вычисляем z_score ---
+    ts_arr, z_arr = create_zscore_curve(start_ts, median_length, tss, price1, price2, size1, size2,
+                                        hist_ts, hist_t1, hist_t2, winds, min_order)
+
+    # --- Собираем итоговый polars DataFrame из буферов (только заполненные строки) ---
+    tdf = pl.DataFrame({'ts': ts_arr, 'z_score': z_arr})
+
+    return df_sec.select('time', 'ts', token_1, token_2, f'{token_1}_size',
+                         f'{token_2}_size', f'{token_1}_bid_price',
+                         f'{token_1}_ask_price', f'{token_1}_bid_size',
+                         f'{token_1}_ask_size', f'{token_2}_bid_price',
+                         f'{token_2}_ask_price', f'{token_2}_bid_size',
+                         f'{token_2}_ask_size').join(tdf, on='ts')
+
+def get_qty(
+        token_1: str,
+        token_2: str,
+        price_1: float,
+        price_2: float,
+        beta: float,
+        coin_information: dict,
+        total_usdt_amount: float = 100.0,
+        fee_rate: float = 0.00055,
+        method: 'str' = 'beta',
+    ):
+    """
+        Вычисляет размеры позиций для двух активов.
+        Args:
+            price_1: цена актива 1 (в долларах)
+            price_2: цена актива 2 (в долларах)
+            beta: хедж-коэффициент (количество B на 1 A)
+            coin_information: словарь с технической информацией по монетам
+            total_usdt_amount: общий размер позиции в долларах
+            fee_rate: комиссия за сделки
+            method: метод распределения денег между плечами сделки. 'beta' или 'usdt_neutral'
+        Returns:
+            qty_1, qty_2: количество токенов 1 и 2
+    """
+
+    if not token_1.endswith('_USDT'):
+        token_1 += '_USDT'
+    if not token_2.endswith('_USDT'):
+        token_2 += '_USDT'
+
+    dp_1 = get_step_info(coin_information, token_1, 'bybit_linear', 'bybit_linear')
+    dp_2 = get_step_info(coin_information, token_2, 'bybit_linear', 'bybit_linear')
+
+    if method == 'beta':
+        qty_1 = total_usdt_amount * (1 - fee_rate) / (price_1 + beta * price_2)
+        qty_1 = round_down(qty_1, dp_1)
+        qty_2 = beta * qty_1
+        qty_2 = round_down(qty_2, dp_2)
+    elif method == 'usdt_neutral':
+        qty_1 = round_down(total_usdt_amount / 2 / (1.0 + 2.0 * fee_rate) / price_1, dp_1)
+        qty_2 = round_down(total_usdt_amount / 2 / (1.0 + 2.0 * fee_rate) / price_2, dp_2)
+
+    return qty_1, qty_2
+
+def calculate_profit_curve(df, token_1, token_2, side, t1_op, t2_op, t1_qty, t2_qty, fee_rate):
+    if side == 'long':
+        tdf = df.select('time', f'{token_1}_bid_price', f'{token_1}_bid_size',
+                        f'{token_2}_ask_price', f'{token_2}_ask_size', 'z_score').rename(
+            {
+                f'{token_1}_bid_price': f'{token_1}_price', f'{token_1}_bid_size': f'{token_1}_size',
+                f'{token_2}_ask_price': f'{token_2}_price', f'{token_2}_ask_size': f'{token_2}_size',
+            }
+        )
+
+        expr_t1_long = (
+            pl.lit(t1_qty)
+            * (pl.col(f"{token_1}_price") - pl.lit(t1_op) - pl.lit(fee_rate) * (pl.lit(t1_op) + pl.col(f"{token_1}_price")))
+        )
+        expr_t2_short = (
+            pl.lit(t2_qty)
+            * (pl.lit(t2_op) - pl.col(f"{token_2}_price") - pl.lit(fee_rate) * (pl.lit(t2_op) + pl.col(f"{token_2}_price")))
+        )
+
+        tdf = tdf.with_columns((expr_t1_long + expr_t2_short).alias("profit"))
+
+
+    elif side == 'short':
+        tdf = df.select('time', f'{token_1}_ask_price', f'{token_1}_ask_size',
+                        f'{token_2}_bid_price', f'{token_2}_bid_size', 'z_score').rename(
+            {
+                f'{token_1}_ask_price': f'{token_1}_price', f'{token_1}_ask_size': f'{token_1}_size',
+                f'{token_2}_bid_price': f'{token_2}_price', f'{token_2}_bid_size': f'{token_2}_size',
+            }
+        )
+
+        expr_t1_short = (
+            pl.lit(t1_qty)
+            * (pl.lit(t1_op) - pl.col(f"{token_1}_price") - pl.lit(fee_rate) * (pl.lit(t1_op) + pl.col(f"{token_1}_price")))
+        )
+
+        expr_t2_long = (
+            pl.lit(t2_qty)
+            * (pl.col(f"{token_2}_price") - pl.lit(t2_op) - pl.lit(fee_rate) * (pl.lit(t2_op) + pl.col(f"{token_2}_price")))
+        )
+
+        tdf = tdf.with_columns((expr_t1_short + expr_t2_long).alias("profit"))
+
+    return tdf
+
+def get_thresholds():
+    data = []
+    with open('./jaref_bot/config/thresholds.txt', 'r') as file:
+        for line in file:
+            line = line.strip()  # Удаляем пробелы и переносы строк
+            if line:  # Игнорируем пустые строки
+                # Преобразуем строку в кортеж с помощью literal_eval
+                tuple_data = ast.literal_eval(line)
+                data.append(tuple_data)
+    return data

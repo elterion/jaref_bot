@@ -181,10 +181,10 @@ class RedisManager():
         return res_df
 
 
-    def add_order(self, exchange, token, qty, price, side, leverage, dp, ord_id, ts, status):
+    def add_order(self, exchange, token, qty, price, side, action, leverage, dp, ord_id, ts, status):
         assert self.db_name == 'orders', 'Переключитесь на orders таблицу!'
         self.redis_client.hset(name=f'pending_orders:{exchange}:{token}',
-                               mapping={'qty': qty, 'price': price, 'side': side,
+                               mapping={'qty': qty, 'price': price, 'side': side, 'action': action,
                                         'leverage': leverage, 'dp': dp, 'id': ord_id,
                                         'ts': ts, 'status': status})
 

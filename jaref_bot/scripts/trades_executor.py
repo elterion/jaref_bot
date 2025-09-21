@@ -6,6 +6,7 @@ from jaref_bot.data.http_api import ExchangeManager, BybitRestAPI
 from jaref_bot.db.postgres_manager import DBManager
 from jaref_bot.db.redis_manager import RedisManager
 from jaref_bot.config.credentials import host, user, password, db_name
+from jaref_bot.core.exceptions.trading import PlaceOrderError
 
 from jaref_bot.trading.functions import handle_opened_position, handle_close_position, place_market_order
 
@@ -30,7 +31,9 @@ def main(demo):
     ct = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f'{ct} Начинаем работу...')
 
-    while True:
+    error_counter = 0
+
+    while error_counter < 5:
         try:
             ct = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             print(f'Текущее время: {ct}', end='\r')
@@ -53,19 +56,35 @@ def main(demo):
                         elif data['side'] == 'short':
                             sl = round(price + 0.85 * price / leverage, dp)
 
-                        resp = place_market_order(demo=demo, exc='bybit_linear', symbol=token,
-                            side=side, volume=data['qty'],
-                            coin_information=coin_information, stop_loss=sl)
+                        try:
+                            resp = place_market_order(demo=demo, exc='bybit_linear', symbol=token,
+                                side=side, volume=data['qty'],
+                                coin_information=coin_information, stop_loss=sl)
 
-                        handle_opened_position(demo=demo, exc='bybit_linear', symbol=token, order_type='market', coin_information=coin_information)
+                            handle_opened_position(demo=demo,
+                                                   exc='bybit_linear',
+                                                   symbol=token,
+                                                   order_type='market',
+                                                   coin_information=coin_information)
+                            error_counter = 0
+                            redis_orders.delete_order('bybit', token)
+                        except PlaceOrderError:
+                            error_counter += 1
+                            break
+
                     else:
-                        resp = place_market_order(demo=demo, exc='bybit_linear', symbol=token,
-                            side=side, volume=data['qty'],
-                            coin_information=coin_information, stop_loss=None)
-                        handle_close_position(demo, resp=resp, exc='bybit_linear', symbol=token, order_type='market',
-                                              leverage=leverage, coin_information=coin_information)
+                        try:
+                            resp = place_market_order(demo=demo, exc='bybit_linear', symbol=token,
+                                side=side, volume=data['qty'],
+                                coin_information=coin_information, stop_loss=None)
+                            handle_close_position(demo, resp=resp, exc='bybit_linear', symbol=token, order_type='market',
+                                                leverage=leverage, coin_information=coin_information)
+                            error_counter = 0
+                            redis_orders.delete_order('bybit', token)
+                        except PlaceOrderError:
+                            error_counter += 1
+                            break
 
-                    redis_orders.delete_order('bybit', token)
         except KeyboardInterrupt:
             print('Завершение работы.')
             break

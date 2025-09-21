@@ -1,6 +1,6 @@
 from jaref_bot.analysis.backtest.pair_trading import backtest
 from jaref_bot.utils.pair_trading import make_df_from_orderbooks, make_trunc_df, get_zscore
-from jaref_bot.utils.pair_trading import create_zscore_df
+from jaref_bot.utils.pair_trading import create_zscore_2df
 from jaref_bot.analysis.strategy_analysis import analyze_strategy
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -254,62 +254,18 @@ def create_data(token_1, token_2, method, start_time, valid_time,
     df_sec = make_trunc_df(df, timeframe='1s', token_1=token_1, token_2=token_2,
                            start_date=valid_time, method='last', return_bid_ask=True)
 
-    res_df = create_zscore_df(token_1, token_2, df_sec, df_4hour, df_hour, hour4_winds, hour1_winds, method, min_order)
+    res_df = create_zscore_2df(token_1, token_2, df_sec, df_4hour, df_hour, hour4_winds, hour1_winds, method, min_order)
     if write_to_file:
         res_df.write_parquet(f'./data/pair_backtest/{token_1}_{token_2}_{method}.parquet')
 
     return res_df
 
-def main(token_1, token_2, method, create_df_flag, method_in,
+def main(method, create_df_flag, method_in, in_params, out_params, hour4_winds, hour1_winds,
          start_time, valid_time, end_time, min_trades, n_top_params, leverage,
-         search_type='grid', min_order=50, n_iters=100_000, verbose=0, save_to_file=False):
-
-    hour4_winds = np.array([8, 10, 12, 14, 16, 18])
-    hour1_winds = np.array([12, 18, 24, 32, 40, 48])
-
-    # Создадим датафрейм с z_score
-    if create_df_flag:
-        create_data(token_1, token_2, method, start_time, valid_time,
-                hour4_winds, hour1_winds, min_order)
+         search_type='grid', min_order=50, n_iters=100_000, verbose=0, save_to_file=None):
 
     # Зададим пространство поиска наилучших параметров входа
     search_space = [('4h', w) for w in hour4_winds] + [('1h', w) for w in hour1_winds]
-
-    in_params = (1.8, 2.0)
-    out_params = (0.25, )
-
-    if search_type == 'grid':
-        top_params = grid_search(token_1, token_2, method, valid_time, end_time, min_trades, n_top_params,
-            search_space, method_in, in_params, out_params,
-            leverage, verbose=verbose)
-    elif search_type == 'random':
-        random_search(token_1, token_2, method, valid_time, end_time, min_trades, n_top_params,
-            search_space, in_params, out_params,
-            leverage, n_iters=n_iters, verbose=verbose)
-
-    if save_to_file:
-        with open('./jaref_bot/config/thresholds.txt', 'w') as file:
-            for p in top_params:
-                file.write(f'({p[0]:.2f}, "{p[1]}", "{p[2]}", "{p[3]}", {p[4]}, {p[5]}, {p[6]})\n')
-
-if __name__ == '__main__':
-    create_df_flag = True
-    method = 'lr'
-    valid_length = 3
-    train_length = 6
-
-    # end_time = datetime.now(ZoneInfo("Europe/Moscow"))
-    end_time = datetime(2025, 9, 12, 23, 30, 0, tzinfo=ZoneInfo("Europe/Moscow"))
-    valid_time = (end_time - timedelta(days=valid_length)).replace(
-        hour=0, minute=0, second=0, microsecond=0)
-    start_time = valid_time - timedelta(days=train_length)
-
-    min_trades = 2
-    n_top_params = 1 # Сколько лучших параметров печатать на экране
-    leverage = 2
-    min_order = 50
-
-    method_in = 'direct'
 
     cointegrated_tokens = []
     with open('./jaref_bot/config/cointegrated_tokens.txt', 'r') as file:
@@ -329,13 +285,64 @@ if __name__ == '__main__':
 
     for pair in missing_pairs:
         cointegrated_tokens.append(pair)
+        print(f'Пара {pair} потеряла коинтеграцию.')
 
+    params_arr = []
 
     # --- Бектест по всем коинтегрированным парам токенов ---
     for token_1, token_2 in tqdm(cointegrated_tokens):
-        # tqdm.write(f'\n===== {token_1} - {token_2} =====')
-        main(token_1, token_2, method, create_df_flag, method_in,
-            start_time, valid_time, end_time, min_trades, n_top_params, leverage,
-            search_type='grid', min_order=min_order, verbose=0, save_to_file=True)
+        # Создадим датафрейм с z_score
+        if create_df_flag:
+            create_data(token_1, token_2, method, start_time, valid_time,
+                    hour4_winds, hour1_winds, min_order)
+
+        if search_type == 'grid':
+            top_params = grid_search(token_1, token_2, method, valid_time, end_time, min_trades, n_top_params,
+                search_space, method_in, in_params, out_params,
+                leverage, verbose=verbose)
+            params_arr.extend(top_params)
+        elif search_type == 'random':
+            random_search(token_1, token_2, method, valid_time, end_time, min_trades, n_top_params,
+                search_space, in_params, out_params,
+                leverage, n_iters=n_iters, verbose=verbose)
+
+    if save_to_file:
+        with open(save_to_file, 'w') as file:
+            for t, p in zip(cointegrated_tokens, params_arr):
+                file.write(f'({p[0]:.2f}, "{t[0]}", "{t[1]}", "{p[2]}", {p[3]}, {p[4]}, {p[5]})\n')
+
+
+if __name__ == '__main__':
+    create_df_flag = True
+    spread_method = 'lr'
+    valid_length = 3
+    train_length = 6
+
+    in_params = (1.4, 1.6, 1.8, 2.0, 2.2)
+    out_params = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5)
+
+    hour4_winds = np.array([8, 10, 12, 14, 16, 18, 24, 30])
+    hour1_winds = np.array([12, 18, 24, 32, 40, 48, 64, 80])
+
+    # end_time = datetime.now(ZoneInfo("Europe/Moscow"))
+    # end_time = datetime(2025, 9, 13, 20, 20, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+    # valid_time = (end_time - timedelta(days=valid_length)).replace(
+    #     hour=0, minute=0, second=0, microsecond=0)
+    # start_time = valid_time - timedelta(days=train_length)
+
+    end_time = datetime(2025, 9, 21, 21, 20, tzinfo=ZoneInfo("Europe/Moscow"))
+    valid_time = datetime(2025, 9, 14, 3, 28, tzinfo=ZoneInfo("Europe/Moscow"))
+    start_time = datetime(2025, 9, 3, 16, 30, tzinfo=ZoneInfo("Europe/Moscow"))
+
+    min_trades = 2
+    n_top_params = 1 # Сколько лучших параметров печатать на экране
+    leverage = 2
+    min_order = 50
+    method_in = 'direct'
+
+    main(spread_method, create_df_flag, method_in, in_params, out_params, hour4_winds, hour1_winds,
+        start_time, valid_time, end_time, min_trades, n_top_params, leverage,
+        search_type='grid', min_order=min_order, verbose=0,
+        save_to_file='./jaref_bot/config/thresholds_test.txt')
 
     db_manager.close()

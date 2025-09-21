@@ -248,7 +248,25 @@ class DBManager:
                 records
             )
 
+    def get_zscore_history(self, token_1, token_2, start_ts, end_ts):
+        query = """
+            SELECT ts, time, exchange, token_1, token_2, profit, z_score
+            FROM zscore_history
+            WHERE token_1 = %s
+              AND token_2 = %s
+              AND ts >= %s
+              AND ts <= %s
+            ORDER BY time;
+        """
 
+        params = [token_1, token_2, start_ts, end_ts]
+
+        with self.conn.cursor() as cur:
+            cur.execute(query, params)
+            rows = cur.fetchall()
+            colnames = [desc[0] for desc in cur.description]
+
+        return pl.DataFrame(rows, schema=colnames, orient="row")
 
     def close_order(self, token, exchange, market_type, qty, close_price, close_usdt_amount, close_fee, closed_at=None):
         """
@@ -531,6 +549,8 @@ class DBManager:
         if end_time is not None:
             query += " AND time <= %s"
             params.append(end_time)
+
+        query += " ORDER BY time;"
 
         with self.conn.cursor() as cur:
             # return pl.read_database(query, cur)

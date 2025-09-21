@@ -2,6 +2,12 @@ import polars as pl
 import numpy as np
 from datetime import datetime, timedelta
 
+from jaref_bot.db.postgres_manager import DBManager
+from jaref_bot.config.credentials import host, user, password, db_name
+db_params = {'host': host, 'user': user, 'password': password, 'dbname': db_name}
+db_manager = DBManager(db_params)
+
+
 def get_duration_string(dur: int):
     if dur < 60:
         return f'{dur} seconds'
@@ -113,7 +119,10 @@ def analyze_strategy(df: pl.DataFrame, start_date, end_date,
     metrics['max_loss'] = round(min(df['total_profit'].min(), 0), 2)
     metrics['avg_profit'] = round(df['total_profit'].mean(), 2)
 
+
     std = df['total_profit'].std()
+    metrics['profit_std'] = round(std, 2)
+
     add_param = 10 # Настраиваемый параметр, который добавляется к знаменателю, чтобы сгладить
                    # разницу между слабоплюсовым, но безубыточным trades_df,
                    # и сильно более плюсовым, но имеющим просадку датафреймом
@@ -152,3 +161,83 @@ def analyze_strategy(df: pl.DataFrame, start_date, end_date,
                                  if metrics['n_trades'] > 0 else 0, 2)
 
     return metrics
+
+def create_pair_trades_df(log_file='./logs/trades.jsonl'):
+    pair_trades_df = pl.DataFrame()
+
+    orders = pl.read_ndjson(log_file).with_columns(
+        pl.col('ct').str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S").dt.replace_time_zone("Europe/Moscow")
+    )
+    trading_history = db_manager.get_table('trading_history', df_type='polars')
+
+    for row in orders.iter_rows(named=True):
+        if row['action'] == 'close':
+            continue
+
+        ct = row['ct']
+        token_1 = row['token_1']
+        token_2 = row['token_2']
+        tf = row['tf']
+        wind = row['wind']
+        thresh_in = row['thresh_in']
+        thresh_out = row['thresh_out']
+        side = row['side']
+        beta = row['beta']
+        z_score = row['z_score']
+
+        t1_data = trading_history.filter(
+            (pl.col('token') == token_1 + '_USDT') & (abs(pl.col('created_at') - ct) < timedelta(seconds=10))
+        )
+        t2_data = trading_history.filter(
+            (pl.col('token') == token_2 + '_USDT') & (abs(pl.col('created_at') - ct) < timedelta(seconds=10))
+        )
+
+        if t1_data.is_empty() or t2_data.is_empty():
+            continue
+
+        t1_op = t1_data['open_price'][0]
+        t2_op = t2_data['open_price'][0]
+        t1_cp = t1_data['close_price'][0]
+        t2_cp = t2_data['close_price'][0]
+        t1_qty = t1_data['qty'][0]
+        t2_qty = t2_data['qty'][0]
+        t1_profit = t1_data['profit'][0]
+        t2_profit = t2_data['profit'][0]
+
+        open_ts = int(datetime.timestamp(ct))
+        close_time = max(t1_data['closed_at'][0], t2_data['closed_at'][0])
+        close_ts = int(datetime.timestamp(close_time))
+        fees = t1_data['realized_pnl'][0] + t2_data['realized_pnl'][0]
+
+        pair_trades_df = pair_trades_df.vstack(pl.DataFrame({
+            'open_time': ct,
+            'open_ts': open_ts,
+            'close_time': close_time,
+            'close_ts': close_ts,
+            'token_1': token_1,
+            'token_2': token_2,
+            'side': side,
+            'tf': tf,
+            'wind': wind,
+            'thresh_in': thresh_in,
+            'thresh_out': thresh_out,
+            'beta': beta,
+            'z_score': z_score,
+            'qty_1': t1_qty,
+            'qty_2': t2_qty,
+            'open_price_1': t1_op,
+            'close_price_1': t1_cp,
+            'open_price_2': t2_op,
+            'close_price_2': t2_cp,
+            'fees': fees,
+            'profit_1': t1_profit,
+            'profit_2': t2_profit,
+            'total_profit': t1_profit + t2_profit,
+            'reason': 1
+        }))
+
+    pair_trades_df = pair_trades_df.with_columns(
+        (pl.col('close_time') - pl.col('open_time')).alias('length'),
+    )
+
+    return pair_trades_df.sort(by='open_time')
