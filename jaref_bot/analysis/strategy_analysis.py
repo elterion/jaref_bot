@@ -20,6 +20,14 @@ def get_duration_string(dur: int):
         mins = (dur - hours * 3600) // 60
         secs = dur - hours * 3600 - 60 * mins
         return f'{hours} hours {mins} minutes {secs} seconds'
+    else:
+        days = int(dur // 86400)
+        remainder = dur % 86400
+        hours = int(remainder // 3600)
+        remainder %= 3600
+        minutes = int(remainder // 60)
+        seconds = int(remainder % 60)
+        return f'{days} days {hours} hours {minutes} minutes {seconds} seconds'
 
 def analyze_strategy(df: pl.DataFrame, start_date, end_date,
                      initial_balance: float = 1000.0) -> dict:
@@ -48,6 +56,9 @@ def analyze_strategy(df: pl.DataFrame, start_date, end_date,
 
     metrics = dict()
     df = df.sort(by="open_ts")
+    df = df.with_columns(
+        (pl.col('close_time') - pl.col('open_time')).alias('length')
+    )
 
     # --- Базовая информация ---
     total_seconds = (end_date - start_date).total_seconds()
@@ -58,14 +69,19 @@ def analyze_strategy(df: pl.DataFrame, start_date, end_date,
     # --- Рассчитываем длительности сделок ---
     df = df.with_columns((pl.col("close_ts") - pl.col("open_ts")).alias('duration'))
 
-    min_dur = int(df['duration'].min())
-    max_dur = int(df['duration'].max())
-    avg_dur = int(df['duration'].mean())
+    metrics["duration_min"] = timedelta(seconds=int(df['length'].min().total_seconds()))
+    metrics["duration_max"] = timedelta(seconds=int(df['length'].max().total_seconds()))
+    metrics["duration_avg"] = timedelta(seconds=int(df['length'].mean().total_seconds()))
 
-    metrics["duration_min"] = get_duration_string(min_dur)
-    metrics["duration_max"] = get_duration_string(max_dur)
-    metrics["duration_avg"] = get_duration_string(avg_dur)
-    metrics['time_in_trade'] = round(df['duration'].sum() / total_seconds, 2)
+
+    # min_dur = int(df['duration'].min())
+    # max_dur = int(df['duration'].max())
+    # avg_dur = int(df['duration'].mean())
+
+    # metrics["duration_min"] = get_duration_string(min_dur)
+    # metrics["duration_max"] = get_duration_string(max_dur)
+    # metrics["duration_avg"] = get_duration_string(avg_dur)
+    # metrics['time_in_trade'] = round(df['duration'].sum() / total_seconds, 2)
 
     # --- Проверяем наличие стоп-лоссов и ликвидаций ---
     metrics['stop_losses'] = df.filter(pl.col("reason") == 2).height

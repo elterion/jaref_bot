@@ -317,8 +317,14 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
 
     print(f'{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Начинаем работу...')
 
-    params = get_thresholds()
-    token_params = sorted(params, key=lambda x: x[0], reverse=True)
+    # params = get_thresholds()
+    # token_params = sorted(params, key=lambda x: x[0], reverse=True)
+
+    cointegrated_tokens = []
+    with open('./jaref_bot/config/cointegrated_tokens.txt', 'r') as file:
+        for line in file:
+            a, b = line.strip().split()
+            cointegrated_tokens.append((a, b))
 
     exc_manager = ExchangeManager()
     exc_manager.add_market("bybit_linear", BybitRestAPI('linear'))
@@ -337,9 +343,19 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
     start_time = end_time - timedelta(hours = td)
 
     print(f'{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Обновление плечей на бирже ByBit')
-    for _, t1_name, t2_name, tf, wind, thresh_in, thresh_out in token_params:
+    for t1_name, t2_name in cointegrated_tokens:
         set_leverage_cached(token=t1_name, leverage=leverage)
         set_leverage_cached(token=t2_name, leverage=leverage)
+
+    tf = '4h'
+    wind = 18
+    thresh_in = 1.8
+    thresh_out = 0.5
+
+    low_in = -thresh_in
+    low_out = -thresh_out
+    high_in = thresh_in
+    high_out = thresh_out
 
     print(f'{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Старт основного цикла.')
     while True:
@@ -362,8 +378,8 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
                 hour_4_df, hour_1_df = get_hist_df(postgre_manager, start_time)
 
                 # Обновляем 1 раз в час пороги входа/выхода на случай, если они изменились
-                params = get_thresholds()
-                token_params = sorted(params, key=lambda x: x[0], reverse=True)
+                # params = get_thresholds()
+                # token_params = sorted(params, key=lambda x: x[0], reverse=True)
 
             # --- Текущие данные ---
             current_data = redis_orderbooks.get_orderbooks(1)
@@ -392,17 +408,19 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
             )
 
             # --- Обрабатываем каждую пару токенов ---
-            for _, t1_name, t2_name, tf, wind, thresh_in, thresh_out in token_params:
+            for t1_name, t2_name in cointegrated_tokens:
                 token_1 = t1_name + '_USDT'
                 token_2 = t2_name + '_USDT'
                 t1_med_price = None
                 t2_med_price = None
                 z_score = 0
 
-                low_in = -thresh_in
-                low_out = -thresh_out
-                high_in = thresh_in
-                high_out = thresh_out
+                # tf, wind, thresh_in, thresh_out
+
+                # low_in = -thresh_in
+                # low_out = -thresh_out
+                # high_in = thresh_in
+                # high_out = thresh_out
 
                 # --- Обновляем открытые пары и текущие ордеры
                 if update_positions_flag:
@@ -547,7 +565,7 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
                 print(zscore_arr)
                 print(err)
                 break
-            sleep(0.9)
+            sleep(0.5)
 
         except KeyboardInterrupt:
             print('\nЗавершение работы.')
@@ -560,12 +578,12 @@ if __name__ == '__main__':
 
 
     exchange = 'bybit'
-    min_order = 50     # Минимальный размер ордера
-    max_position = 100 # Максимальный размер одного плеча в парной позиции
-    max_pairs = 6      # Максимальное кол-во открытых позиций
+    min_order = 25     # Минимальный размер ордера
+    max_position = 50 # Максимальный размер одного плеча в парной позиции
+    max_pairs = 5      # Максимальное кол-во открытых позиций
     leverage = 2       # Плечо
     fee_rate = 0.00055 # Процент комиссии биржи
-    td = 120           # За сколько последних часов брать историю
+    td = 144           # За сколько последних часов брать историю
 
 
     main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fee_rate, td)
