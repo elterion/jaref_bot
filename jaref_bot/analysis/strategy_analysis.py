@@ -57,7 +57,7 @@ def analyze_strategy(df: pl.DataFrame, start_date, end_date,
     metrics = dict()
     df = df.sort(by="open_ts")
     df = df.with_columns(
-        (pl.col('close_time') - pl.col('open_time')).alias('length')
+        (pl.col('close_time') - pl.col('open_time')).alias('duration')
     )
 
     # --- Базовая информация ---
@@ -69,19 +69,9 @@ def analyze_strategy(df: pl.DataFrame, start_date, end_date,
     # --- Рассчитываем длительности сделок ---
     df = df.with_columns((pl.col("close_ts") - pl.col("open_ts")).alias('duration'))
 
-    metrics["duration_min"] = timedelta(seconds=int(df['length'].min().total_seconds()))
-    metrics["duration_max"] = timedelta(seconds=int(df['length'].max().total_seconds()))
-    metrics["duration_avg"] = timedelta(seconds=int(df['length'].mean().total_seconds()))
-
-
-    # min_dur = int(df['duration'].min())
-    # max_dur = int(df['duration'].max())
-    # avg_dur = int(df['duration'].mean())
-
-    # metrics["duration_min"] = get_duration_string(min_dur)
-    # metrics["duration_max"] = get_duration_string(max_dur)
-    # metrics["duration_avg"] = get_duration_string(avg_dur)
-    # metrics['time_in_trade'] = round(df['duration'].sum() / total_seconds, 2)
+    metrics["duration_min"] = timedelta(seconds=int(df['duration'].min()))
+    metrics["duration_max"] = timedelta(seconds=int(df['duration'].max()))
+    metrics["duration_avg"] = timedelta(seconds=int(df['duration'].mean()))
 
     # --- Проверяем наличие стоп-лоссов и ликвидаций ---
     metrics['stop_losses'] = df.filter(pl.col("reason") == 2).height
@@ -137,6 +127,8 @@ def analyze_strategy(df: pl.DataFrame, start_date, end_date,
 
 
     std = df['total_profit'].std()
+    if std is None:
+        std = 0
     metrics['profit_std'] = round(std, 2)
 
     add_param = 10 # Настраиваемый параметр, который добавляется к знаменателю, чтобы сгладить
@@ -144,7 +136,9 @@ def analyze_strategy(df: pl.DataFrame, start_date, end_date,
                    # и сильно более плюсовым, но имеющим просадку датафреймом
                    # Чем больше add_param, тем меньше преимущество у безубыточного df.
 
-    profit_ratio = 10 * df['total_profit'].sum() / (abs(metrics['max_drawdown']) + add_param) / (std + add_param)
+    profit_ratio = 100 * (df['total_profit'].sum() /
+                          (abs(metrics['max_drawdown']) + add_param) /
+                          (std + 5 * add_param))
     metrics['profit_ratio'] = round(profit_ratio, 3)
 
     return metrics
@@ -186,7 +180,7 @@ def create_pair_trades_df(log_file='./logs/trades.jsonl'):
     )
     trading_history = db_manager.get_table('trading_history', df_type='polars')
 
-    for row in orders.iter_rows(named=True):
+    for i, row in enumerate(orders.iter_rows(named=True)):
         if row['action'] == 'close':
             continue
 
@@ -199,7 +193,12 @@ def create_pair_trades_df(log_file='./logs/trades.jsonl'):
         thresh_out = row['thresh_out']
         side = row['side']
         beta = row['beta']
-        z_score = row['z_score']
+        z_score_open = row['z_score']
+
+        for row in orders[i:].iter_rows(named=True):
+            if row['token_1'] == token_1 and row['token_2'] == token_2 and row['action'] == 'close':
+                z_score_close = row['z_score']
+                break
 
         t1_data = trading_history.filter(
             (pl.col('token') == token_1 + '_USDT') & (abs(pl.col('created_at') - ct) < timedelta(seconds=10))
@@ -238,7 +237,8 @@ def create_pair_trades_df(log_file='./logs/trades.jsonl'):
             'thresh_in': thresh_in,
             'thresh_out': thresh_out,
             'beta': beta,
-            'z_score': z_score,
+            'z_score_open': z_score_open,
+            'z_score_close': z_score_close,
             'qty_1': t1_qty,
             'qty_2': t2_qty,
             'open_price_1': t1_op,
@@ -253,7 +253,7 @@ def create_pair_trades_df(log_file='./logs/trades.jsonl'):
         }))
 
     pair_trades_df = pair_trades_df.with_columns(
-        (pl.col('close_time') - pl.col('open_time')).alias('length'),
+        (pl.col('close_time') - pl.col('open_time')).alias('duration'),
     )
 
     return pair_trades_df.sort(by='open_time')

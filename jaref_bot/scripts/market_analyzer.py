@@ -37,12 +37,16 @@ def get_thresholds():
 
 def place_order(token_1, token_2, pos_side, qty_1, qty_2, t1_price, t2_price,
                 t1_orig_side, t2_orig_side, ts, dp_1, dp_2, db_manager, redis_manager):
+    side_1 = 'Buy' if t1_orig_side == 'long' else 'Sell'
+    side_2 = 'Buy' if t1_orig_side == 'short' else 'Sell'
+
     if pos_side == 'open':
         db_manager.add_pair_order(token_1=token_1, token_2=token_2, side=t1_orig_side, qty_1=qty_1, qty_2=qty_2)
+
         redis_manager.add_order(exchange='bybit',
                                 token=token_1,
                                 qty=qty_1,
-                                side=t1_orig_side,
+                                side=side_1,
                                 action='open',
                                 price=t1_price,
                                 leverage=leverage,
@@ -53,7 +57,7 @@ def place_order(token_1, token_2, pos_side, qty_1, qty_2, t1_price, t2_price,
         redis_manager.add_order(exchange='bybit',
                                 token=token_2,
                                 qty=qty_2,
-                                side=t2_orig_side,
+                                side=side_2,
                                 action='open',
                                 price=t2_price,
                                 leverage=leverage,
@@ -63,11 +67,12 @@ def place_order(token_1, token_2, pos_side, qty_1, qty_2, t1_price, t2_price,
                                 status='created')
 
     elif pos_side == 'close':
-        db_manager.delete_pair_order(token_1=token_1, token_2=token_2)
+        db_manager.close_pair_order(token_1=token_1, token_2=token_2, side=t1_orig_side)
+
         redis_manager.add_order(exchange='bybit',
                                 token=token_1,
                                 qty=qty_1,
-                                side=t2_orig_side,
+                                side=side_2,
                                 action='close',
                                 price=t1_price,
                                 leverage=leverage,
@@ -78,7 +83,7 @@ def place_order(token_1, token_2, pos_side, qty_1, qty_2, t1_price, t2_price,
         redis_manager.add_order(exchange='bybit',
                                 token=token_2,
                                 qty=qty_2,
-                                side=t1_orig_side,
+                                side=side_1,
                                 action='close',
                                 price=t2_price,
                                 leverage=leverage,
@@ -212,33 +217,19 @@ def change_position(token_1, token_2, pos_side, t1_orig_side, t2_orig_side, t1_d
                 log_data['z_score'], log_data['beta'])
 
 def get_hist_df(postgre_manager, start_time):
-    hour_1_df = postgre_manager.get_orderbooks(exchange='bybit',
-                                             market_type='linear',
-                                             interval='1h',
-                                             start_date=start_time)
-    cols_to_drop = ('exchange', 'market_type', 'bid_price', 'bid_size', 'ask_price', 'ask_size')
-    hour_1_df = hour_1_df.with_columns(
-            ((pl.col('bid_price') + pl.col('ask_price')) / 2.0).alias('avg_price')
-        )
-    hour_1_df = hour_1_df.drop(cols_to_drop)
+    hour_1_df = postgre_manager.get_orderbooks(interval='1h', start_date=start_time)
+    hour_1_df = hour_1_df.with_columns(pl.col('price').alias('avg_price'))
 
-    hour_4_df = postgre_manager.get_orderbooks(exchange='bybit',
-                                         market_type='linear',
-                                         interval='4h',
-                                         start_date=start_time)
-    hour_4_df = hour_4_df.with_columns(
-            ((pl.col('bid_price') + pl.col('ask_price')) / 2.0).alias('avg_price')
-        )
-    hour_4_df = hour_4_df.drop(cols_to_drop)
+    hour_4_df = postgre_manager.get_orderbooks(interval='4h', start_date=start_time)
+    hour_4_df = hour_4_df.with_columns(pl.col('price').alias('avg_price'))
 
     return hour_4_df, hour_1_df
 
-def calculate_profit(open_price, close_price, n_coins=None, usdt_amount=None, side='long', fee_rate=0.00055):
-    if n_coins is None:
-        n_coins = round(usdt_amount / open_price)
-
+def calculate_profit(open_price, close_price, n_coins, side, fee_rate=0.00055):
     usdt_open = n_coins * open_price
     open_fee = usdt_open * fee_rate
+
+    # print(f'{n_coins=}; {close_price=}')
 
     usdt_close = n_coins * close_price
     close_fee = usdt_close * fee_rate
@@ -312,45 +303,38 @@ def write_order_log(ts, ct, token_1, token_2, tf, wind, thresh_in, thresh_out, s
     with open('./logs/trades.jsonl', 'a', encoding='utf-8') as f:
         f.write(json_log + '\n')
 
-def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fee_rate, td):
+def main(demo, open_new_orders, tf, wind, thresh_in, thresh_out,
+         max_position, min_order, max_pairs, leverage, fee_rate, td):
     update_positions_flag = False
 
     print(f'{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Начинаем работу...')
 
-    # params = get_thresholds()
-    # token_params = sorted(params, key=lambda x: x[0], reverse=True)
-
+    # --- Загружаем все коинтегрированные токены ---
     cointegrated_tokens = []
     with open('./jaref_bot/config/cointegrated_tokens.txt', 'r') as file:
         for line in file:
             a, b = line.strip().split()
             cointegrated_tokens.append((a, b))
 
+    # --- Загружаем техническую информацию по монетам с биржи ---
     exc_manager = ExchangeManager()
     exc_manager.add_market("bybit_linear", BybitRestAPI('linear'))
-
-    db_params = {'host': host, 'user': user, 'password': password, 'dbname': db_name}
-    postgre_manager = DBManager(db_params)
-    redis_orders = RedisManager(db_name = 'orders')
-    redis_orderbooks = RedisManager(db_name = 'orderbooks')
-
     coin_information = exc_manager.get_instrument_data()
 
     with open("./data/coin_information.pkl", "wb") as f:
         pickle.dump(coin_information, f)
 
-    end_time = datetime.now().replace(tzinfo=ZoneInfo("Europe/Moscow"))
-    start_time = end_time - timedelta(hours = td)
+    # --- Инициируем менеджеры, работающие с БД ---
+    db_params = {'host': host, 'user': user, 'password': password, 'dbname': db_name}
+    postgre_manager = DBManager(db_params)
+    redis_orders = RedisManager(db_name = 'orders')
+    redis_orderbooks = RedisManager(db_name = 'orderbooks')
+    redis_sys = RedisManager(db_name = 'system_state')
 
     print(f'{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Обновление плечей на бирже ByBit')
     for t1_name, t2_name in cointegrated_tokens:
         set_leverage_cached(token=t1_name, leverage=leverage)
         set_leverage_cached(token=t2_name, leverage=leverage)
-
-    tf = '4h'
-    wind = 18
-    thresh_in = 1.8
-    thresh_out = 0.5
 
     low_in = -thresh_in
     low_out = -thresh_out
@@ -367,19 +351,26 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
             ct = time_now.strftime('%Y-%m-%d %H:%M:%S')
             print(f'Контрольное время: {ct}', end='\r')
 
+            # --- Устанавливаем heartbeat отметку в Redis ---
+            redis_sys.set_system_state('market_analyzer', 1)
+
+            # --- Проверяем работу модуля trades_executor ---
+            if not redis_sys.get_system_state('trades_executor'):
+                print(f'{ct} Потеряна связь с trades_executor!')
+                break
+
             # --- Подгружаем исторические датафреймы 1 раз в час ---
+            end_time = datetime.now().replace(tzinfo=ZoneInfo("Europe/Moscow"))
+            start_time = end_time - timedelta(hours = td)
+
             try:
-                last_updates_1h = (datetime.now(ZoneInfo("Europe/Moscow")) - hour_1_df[-1]['bucket'][0]).seconds
+                last_updates_1h = (datetime.now(ZoneInfo("Europe/Moscow")) - hour_1_df[-1]['time'][0]).seconds
             except NameError:
                 hour_4_df, hour_1_df = get_hist_df(postgre_manager, start_time)
-                last_updates_1h = (datetime.now(ZoneInfo("Europe/Moscow")) - hour_1_df[-1]['bucket'][0]).seconds
+                last_updates_1h = (datetime.now(ZoneInfo("Europe/Moscow")) - hour_1_df[-1]['time'][0]).seconds
 
             if last_updates_1h > 3665: # 1 час 1 минута 5 секунд
                 hour_4_df, hour_1_df = get_hist_df(postgre_manager, start_time)
-
-                # Обновляем 1 раз в час пороги входа/выхода на случай, если они изменились
-                # params = get_thresholds()
-                # token_params = sorted(params, key=lambda x: x[0], reverse=True)
 
             # --- Текущие данные ---
             current_data = redis_orderbooks.get_orderbooks(1)
@@ -398,9 +389,9 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
 
             # --- Секундный датафрейм для подсчёта среднего значения ---
             end_t = datetime.now().replace(tzinfo=ZoneInfo("Europe/Moscow"))
-            st_t = end_t - timedelta(seconds = 6)
+            st_t = end_t - timedelta(seconds = 20)
 
-            df_sec = postgre_manager.get_raw_orderbooks(exchange='bybit', market_type='linear', start_time=st_t).with_columns(
+            tick_df = postgre_manager.get_tick_ob(start_time=st_t).with_columns(
                 ((pl.col('bid_price') + pl.col('ask_price')) / 2.0).alias('avg_price')
             ).filter(
                 (pl.col('bid_size') * pl.col('bid_price') > min_order) &
@@ -411,25 +402,31 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
             for t1_name, t2_name in cointegrated_tokens:
                 token_1 = t1_name + '_USDT'
                 token_2 = t2_name + '_USDT'
-                t1_med_price = None
-                t2_med_price = None
                 z_score = 0
 
-                # tf, wind, thresh_in, thresh_out
-
-                # low_in = -thresh_in
-                # low_out = -thresh_out
-                # high_in = thresh_in
-                # high_out = thresh_out
-
-                # --- Обновляем открытые пары и текущие ордеры
+                # --- Обновляем открытые пары и текущие ордеры ---
                 if update_positions_flag:
                     pending_orders = redis_orders.get_pending_orders()
                     current_orders = postgre_manager.get_table('current_orders', df_type='polars')
                     pairs = postgre_manager.get_table('pairs', df_type='polars')
                     update_positions_flag = False
 
-                # Пропускаем пару, если уже открыто максимальное количество позиций, а для этой пары позиция не открыта
+                # --- Выбираем из общего датафрейма нужные токены ---
+                t1_tick_df = tick_df.filter(pl.col('token') == token_1)
+                t2_tick_df = tick_df.filter(pl.col('token') == token_2)
+
+                # --- Проверяем, что датафрейм не пустой ---
+                if t1_tick_df.height < 2 or t2_tick_df.height < 2:
+                    continue
+
+                # --- Проверяем, что этой пары нет в очереди на закрытие ---
+                if pairs.filter((pl.col('token_1') == token_1) &
+                                (pl.col('token_2') == token_2) &
+                                (pl.col('status') == 'closing')).height > 0:
+                    continue
+
+                # Пропускаем пару, если уже открыто максимальное количество позиций,
+                # а для этой пары позиция не открыта
                 if (pairs.height >= max_pairs and pairs.filter(
                             (pl.col('token_1') == token_1) & (pl.col('token_2') == token_2)
                             ).is_empty()
@@ -439,9 +436,8 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
                 # --- Получаем средние цены за исторический период ---
                 hist_df = hour_1_df if tf == '1h' else hour_4_df
 
-                # Убираем последнее значение, которое постоянно обновляется
-                token_1_hist_price = hist_df.filter(pl.col('token') == token_1).tail(2 * wind + 1)['avg_price'][:-1].to_numpy()
-                token_2_hist_price = hist_df.filter(pl.col('token') == token_2).tail(2 * wind + 1)['avg_price'][:-1].to_numpy()
+                token_1_hist_price = hist_df.filter(pl.col('token') == token_1).tail(2 * wind + 1)['avg_price'].to_numpy()
+                token_2_hist_price = hist_df.filter(pl.col('token') == token_2).tail(2 * wind + 1)['avg_price'].to_numpy()
 
                 # --- Получаем текущие цены ---
                 t1_curr_data = current_data.filter(pl.col('symbol') == token_1)
@@ -458,25 +454,18 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
                 if abs(t1_ts - t2_ts) > 10: # Если разница во времени между двумя ценами больше 10 секунд, пропускаем эту пару
                     continue
 
-                # Вместо текущей цены подставляем в функцию для расчёта z_score медианную цену за 5 секунд, чтобы избежать выбросов
-                t1_df_sec = df_sec.filter(pl.col('token') == token_1)
-                t2_df_sec = df_sec.filter(pl.col('token') == token_2)
 
-                if t1_df_sec.height >= 3 and t2_df_sec.height >= 3:
-                    t1_med_price = t1_df_sec['avg_price'].median()
-                    t2_med_price = t2_df_sec['avg_price'].median()
-                    t1_med = np.append(token_1_hist_price, t1_med_price)
-                    t2_med = np.append(token_2_hist_price, t2_med_price)
-                    t1_curr = np.append(token_1_hist_price, t1_curr_data['avg_price'][0])
-                    t2_curr = np.append(token_2_hist_price, t2_curr_data['avg_price'][0])
 
-                    _, beta, zscore = get_lr_zscore(t1_med, t2_med, np.array([wind]))
-                    _, beta_curr, zscore_curr = get_lr_zscore(t1_curr, t2_curr, np.array([wind]))
-                    z_score = zscore[0]
-                    z_score_curr = zscore_curr[0]
-                    beta = beta[0]
-                else:
-                    continue
+                t1_med = np.append(token_1_hist_price, t1_tick_df['avg_price'].median())
+                t2_med = np.append(token_2_hist_price, t2_tick_df['avg_price'].median())
+                t1_curr = np.append(token_1_hist_price, t1_curr_data['avg_price'][0])
+                t2_curr = np.append(token_2_hist_price, t2_curr_data['avg_price'][0])
+
+                _, _, _, _, beta, zscore = get_lr_zscore(t1_med, t2_med, np.array([wind]))
+                _, _, _, _, beta_curr, zscore_curr = get_lr_zscore(t1_curr, t2_curr, np.array([wind]))
+                z_score = zscore[0]
+                z_score_curr = zscore_curr[0]
+                beta = beta[0]
 
                 # ----- Проверяем условия для входа в позицию -----
                 if open_new_orders and pairs.height < max_pairs:
@@ -533,8 +522,9 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
                     side_1 = 'long' if long_opened else 'short'
                     side_2 = 'short' if long_opened else 'long'
 
-                    curr_profit_1 = calculate_profit(open_price=t1_op, close_price=t1_med_price, n_coins=q1, side=side_1)
-                    curr_profit_2 = calculate_profit(open_price=t2_op, close_price=t2_med_price, n_coins=q2, side=side_2)
+                    curr_profit_1 = calculate_profit(open_price=t1_op, close_price=t1_tick_df['avg_price'].median(), n_coins=q1, side=side_1)
+                    curr_profit_2 = calculate_profit(open_price=t2_op, close_price=t2_tick_df['avg_price'].median(), n_coins=q2, side=side_2)
+
                     curr_profit = curr_profit_1 + curr_profit_2
                     zscore_arr.append((ts, 'bybit', token_1, token_2, curr_profit, z_score))
 
@@ -561,9 +551,9 @@ def main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fe
 
             try:
                 postgre_manager.add_data_to_zscore_history(zscore_arr)
-            except Exception as err:
-                print(zscore_arr)
-                print(err)
+            except KeyboardInterrupt:
+                # print(zscore_arr)
+                # print(err)
                 break
             sleep(0.5)
 
@@ -578,12 +568,18 @@ if __name__ == '__main__':
 
 
     exchange = 'bybit'
-    min_order = 25     # Минимальный размер ордера
-    max_position = 50 # Максимальный размер одного плеча в парной позиции
+    min_order = 40     # Минимальный размер ордера
+    max_position = 50  # Максимальный размер одного плеча в парной позиции
     max_pairs = 5      # Максимальное кол-во открытых позиций
     leverage = 2       # Плечо
     fee_rate = 0.00055 # Процент комиссии биржи
-    td = 144           # За сколько последних часов брать историю
+    td = 120            # За сколько последних часов брать историю
+
+    tf = '4h'
+    wind = 8
+    thresh_in = 1.8
+    thresh_out = 0.25
 
 
-    main(demo, open_new_orders, max_position, min_order, max_pairs, leverage, fee_rate, td)
+    main(demo, open_new_orders, tf, wind, thresh_in, thresh_out,
+         max_position, min_order, max_pairs, leverage, fee_rate, td)

@@ -75,17 +75,17 @@ def handle_opened_position(demo, exc, symbol, order_type, coin_information):
 
     if pos:
         if pos['qty'] > 0 and pos['usdt_amount'] > 0:
-            postgre_manager.place_order(token=symbol, exchange=exchange, market_type=market_type, order_type=order_type,
-                                   order_side=pos['order_side'], qty=abs(pos['qty']), price=pos['price'],
-                                   usdt_amount=pos['usdt_amount'], realized_pnl=pos['realized_pnl'], leverage=pos['leverage'])
+            postgre_manager.place_order(token=symbol, order_type=order_type, order_side=pos['order_side'],
+                    qty=abs(pos['qty']), price=pos['price'], usdt_amount=pos['usdt_amount'],
+                    realized_pnl=pos['realized_pnl'], leverage=pos['leverage'])
             print(f'[{ct}] [OPENED] {pos['order_side']} {pos['qty']} {symbol[:-5]} for {pos['usdt_amount']:.4f} (price: {pos['price']}) on {exchange}; leverage: {pos['leverage']}')
             return True
         elif pos['qty'] == 0:
-            postgre_manager.delete_order(token=symbol, exchange=exchange, market_type='linear')
+            postgre_manager.delete_order(token=symbol)
         else:
             return pos
     else:
-        postgre_manager.delete_order(token=symbol, exchange=exchange, market_type='linear')
+        postgre_manager.delete_order(token=symbol)
 
 def handle_close_position(demo, resp, exc, symbol, order_type, leverage, coin_information):
     exc_dict = {'bybit': BybitTrade, 'okx': OkxTrade, 'gate': GateTrade}
@@ -101,8 +101,6 @@ def handle_close_position(demo, resp, exc, symbol, order_type, leverage, coin_in
 
     if pos:
         postgre_manager.close_order(token=symbol,
-                                    exchange=exchange,
-                                    market_type=market_type,
                                     qty=abs(pos['qty']),
                                     close_price=pos['price'],
                                     close_usdt_amount=usdt_amount,

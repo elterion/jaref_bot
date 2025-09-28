@@ -13,15 +13,6 @@ class DBManager:
     def close(self):
         self.conn.close()
 
-    def test_add(self, bucket, exchange, market_type, token, avg_bid, avg_ask):
-        query = """
-        INSERT INTO market_data_5s (bucket, exchange, market_type, token, avg_bid, avg_ask)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        """
-
-        with self.conn.cursor() as cursor:
-            cursor.execute(query, (bucket, exchange, market_type, token, avg_bid, avg_ask))
-
     def update_funding_data(self, records):
         """
         Обновление данных фандинга. Если запись с таким же (token, exchange)
@@ -46,155 +37,13 @@ class DBManager:
         with self.conn.cursor() as cursor:
             cursor.executemany(sql, records)
 
-    def add_public_trade(self, time: datetime, exchange: str, symbol: str,
-                         side: str, price: float, volume: float):
-        """
-        Добавляет запись о публичной сделке в таблицу `public_trades`.
-
-        Параметры:
-        ----------
-        time : datetime.datetime
-            Точное время сделки.
-        exchange : str
-            Название биржи (например: 'binance', 'bybit').
-        symbol : str
-            Торговая пара (например: 'BTC_USDT').
-        side : str
-            Направление сделки: 'buy' или 'sell'.
-        price : float
-            Цена актива.
-        volume : float
-            Объем актива.
-        """
-
-        with self.conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO public_trades (time, exchange, symbol, side, price, volume)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (time, exchange, symbol, side, price, volume)
-            )
-
-    def get_public_trades(self, exchange: str, token: str, return_type: str='pandas'):
-        """
-        Возвращает все сделки для указанной биржи и торговой пары из таблицы `public_trades`.
-
-        Параметры:
-        ----------
-        exchange : str
-            Название биржи (например: 'binance').
-        token : str
-            Торговая пара (например: 'BTC_USDT').
-        return_type : str, опционально
-            Формат возвращаемых данных:
-            - 'pandas' → pd.DataFrame (по умолчанию)
-            - 'polars' → pl.DataFrame
-
-        Возвращает:
-        -----------
-        DataFrame (pandas/polars)
-            Таблица со всеми столбцами из `public_trades`, отфильтрованная по `exchange` и `symbol`.
-        """
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute("""
-                            SELECT * FROM public_trades
-                            WHERE symbol = %s AND exchange = %s
-                            ORDER BY time
-                            """, (token, exchange))
-                rows = cur.fetchall()
-                columns = [desc[0] for desc in cur.description]
-                if return_type == 'pandas':
-                    df = pd.DataFrame(rows, columns=columns)
-                    df.reset_index(drop=True, inplace=True)
-                elif return_type == 'polars':
-                    df = pl.DataFrame(rows, schema=columns, orient="row")
-                return df
-        except Exception as e:
-            self.conn.rollback()
-            raise ValueError(f"Failed to fetch data from table: {e}")
-
-    def get_last_trade(self, exchange, token, return_type='pandas'):
-        """
-        Возвращает последнюю сделку для указанной биржи и торговой пары из таблицы public_trades.
-
-        Параметры:
-        ----------
-        exchange : str
-            Название биржи (например: 'binance').
-        token : str
-            Торговая пара (например: 'BTC_USDT').
-        return_type : str, опционально
-            Формат возвращаемых данных:
-            - 'pandas' → pd.Series (одна строка в виде Series)
-            - 'polars' → pl.DataFrame (одна строка)
-
-        Возвращает:
-        -----------
-        Series (pandas) или DataFrame (polars)
-            Данные последней сделки.
-        """
-        try:
-            with self.conn.cursor() as cur:
-                query = """
-                    SELECT *
-                    FROM public_trades
-                    WHERE symbol = %s AND exchange = %s
-                    ORDER BY time DESC
-                    LIMIT 1
-                """
-                cur.execute(query, (token, exchange))
-                row = cur.fetchone()
-                columns = [desc[0] for desc in cur.description] if cur.description else []
-
-                if return_type == 'pandas':
-                    df = pd.Series(row, index=columns)
-                    # df.reset_index(drop=True, inplace=True)
-                    return df
-                elif return_type == 'polars':
-                    return pl.DataFrame([row], schema=columns, orient="row")
-                else:
-                    raise ValueError(f"Unsupported return type: {return_type}")
-
-        except Exception as e:
-            self.conn.rollback()
-            raise ValueError(f"Failed to fetch last trade: {e}")
-
-    def get_candlestick(self, exchange: str, token: str, return_type: str='pandas'):
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute("""
-                            SELECT * FROM ohlcv_5min
-                            WHERE symbol = %s AND exchange = %s
-                            ORDER BY bucket
-                            """, (token, exchange))
-                rows = cur.fetchall()
-                columns = [desc[0] for desc in cur.description]
-
-                if return_type == 'pandas':
-                    df = pd.DataFrame(rows, columns=columns)
-                    df.reset_index(drop=True, inplace=True)
-                elif return_type == 'polars':
-                    df = pl.DataFrame(rows, schema=columns, orient="row")
-                return df
-        except Exception as e:
-            self.conn.rollback()
-            raise ValueError(f"Failed to fetch data from table: {e}")
-
-    def place_order(self, token, exchange, market_type, order_type, order_side,
+    def place_order(self, token, order_type, order_side,
                   qty, price, usdt_amount, realized_pnl, leverage, created_at=None):
         """Добавляет новый ордер в таблицу current_orders"""
         query = """
-        INSERT INTO current_orders (token, exchange, market_type, order_type,
+        INSERT INTO current_orders (token, order_type,
         order_side, qty, price, usdt_amount, realized_pnl, leverage, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (token, exchange, market_type)
-        DO UPDATE SET
-            qty = EXCLUDED.qty,
-            price = EXCLUDED.price,
-            usdt_amount = EXCLUDED.usdt_amount,
-            realized_pnl = EXCLUDED.realized_pnl;
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
 
         # Если created_at не передан, используем текущее время
@@ -204,23 +53,43 @@ class DBManager:
 
         try:
             with self.conn.cursor() as cursor:
-                cursor.execute(query, (token, exchange, market_type, order_type,
+                cursor.execute(query, (token, order_type,
                     order_side, qty, price, usdt_amount, realized_pnl, leverage, created_at))
         except psycopg.IntegrityError as e:
             self.conn.rollback()
-            raise UniqueViolation(f"Order '{token}' on {exchange}.{market_type} already exists.")
+            raise UniqueViolation(f"Order '{token}' already exists.")
 
     def add_pair_order(self, token_1, token_2, side, qty_1, qty_2):
         """Добавляет новый ордер в таблицу pairs"""
         query = """
         INSERT INTO pairs (token_1, token_2, side, qty_1, qty_2)
         VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (token_1, token_2)
-        DO NOTHING
         """
 
         with self.conn.cursor() as cursor:
             cursor.execute(query, (token_1, token_2, side, qty_1, qty_2))
+
+    def commit_pair_order(self, token_1, token_2, side):
+        """Обновляет статус ордера на 'active' по ключу (token_1, token_2, side)"""
+        query = """
+            UPDATE pairs
+            SET status = 'active'
+            WHERE token_1 = %s AND token_2 = %s AND side = %s
+        """
+
+        with self.conn.cursor() as cursor:
+            cursor.execute(query, (token_1, token_2, side))
+
+    def close_pair_order(self, token_1, token_2, side):
+        """Обновляет статус ордера на 'closing' по ключу (token_1, token_2, side)"""
+        query = """
+            UPDATE pairs
+            SET status = 'closing'
+            WHERE token_1 = %s AND token_2 = %s AND side = %s
+        """
+
+        with self.conn.cursor() as cursor:
+            cursor.execute(query, (token_1, token_2, side))
 
     def delete_pair_order(self, token_1, token_2):
         """Удаляет запись из таблицы pairs по ключу (token_1, token_2)"""
@@ -268,14 +137,12 @@ class DBManager:
 
         return pl.DataFrame(rows, schema=colnames, orient="row")
 
-    def close_order(self, token, exchange, market_type, qty, close_price, close_usdt_amount, close_fee, closed_at=None):
+    def close_order(self, token, qty, close_price, close_usdt_amount, close_fee, closed_at=None):
         """
         Переносит информацию из таблицы current_orders в таблицу trading_history
 
         Args:
             token (str): Токен
-            exchange (str): Биржа
-            market_type (str): Тип рынка
             qty (float): Количество
             close_price (float): Цена закрытия
             close_usdt_amount (float): Сумма в USDT при закрытии
@@ -288,133 +155,126 @@ class DBManager:
         Raises:
             Exception: Если запись не найдена или произошла ошибка при выполнении
         """
+        # Устанавливаем московское время для закрытия, если не указано
+        if closed_at is None:
+            Moscow_TZ = timezone(timedelta(hours=3))
+            closed_at = datetime.now(Moscow_TZ).strftime('%Y-%m-%d %H:%M:%S')
+
+        cursor = self.conn.cursor()
+
+        # Находим запись в текущих ордерах
+        cursor.execute("""
+            SELECT token, order_type, order_side,
+                price as open_price, usdt_amount as open_usdt_amount,
+                qty, realized_pnl as realized_pnl, leverage, created_at
+            FROM current_orders
+            WHERE token = %s
+        """, (token, ))
+
+        order_record = cursor.fetchone()
+
+        if not order_record:
+            raise Exception(f"Ордер не найден: {token}")
+
+        # Создаем словарь для данных из текущей записи
+        order_data = {
+            'token': order_record[0],
+            'order_type': order_record[1],
+            'order_side': order_record[2],
+            'open_price': order_record[3],
+            'open_usdt_amount': order_record[4],
+            'qty_current': order_record[5],
+            'realized_pnl': order_record[6],
+            'leverage': order_record[7],
+            'created_at': order_record[8]
+        }
+
+        # Начинаем транзакцию
+        self.conn.autocommit = False
+        real_pnl = order_data['realized_pnl'] + close_fee
+
         try:
-            # Устанавливаем московское время для закрытия, если не указано
-            if closed_at is None:
-                Moscow_TZ = timezone(timedelta(hours=3))
-                closed_at = datetime.now(Moscow_TZ).strftime('%Y-%m-%d %H:%M:%S')
+            # Проверяем, закрывается ли ордер полностью или частично
+            if float(order_data['qty_current']) - float(qty) < 0.000001:
+                # Полное закрытие ордера
 
-            cursor = self.conn.cursor()
+                # Добавляем запись в историю торговли
+                cursor.execute("""
+                    INSERT INTO trading_history (
+                        token, order_type, order_side,
+                        open_price, close_price, open_usdt_amount, close_usdt_amount,
+                        qty, realized_pnl, leverage, created_at, closed_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    order_data['token'], order_data['order_type'], order_data['order_side'],
+                    order_data['open_price'], close_price, order_data['open_usdt_amount'],
+                    close_usdt_amount, qty, real_pnl,
+                    order_data['leverage'], order_data['created_at'], closed_at
+                ))
 
-            # Находим запись в текущих ордерах
-            cursor.execute("""
-                SELECT token, exchange, market_type, order_type, order_side,
-                    price as open_price, usdt_amount as open_usdt_amount,
-                    qty, realized_pnl as realized_pnl, leverage, created_at
-                FROM current_orders
-                WHERE token = %s AND exchange = %s AND market_type = %s
-            """, (token, exchange, market_type))
+                # Удаляем запись из текущих ордеров
+                cursor.execute("""
+                    DELETE FROM current_orders
+                    WHERE token = %s
+                """, (token, ))
 
-            order_record = cursor.fetchone()
+            else:
+                # Частичное закрытие ордера
 
-            if not order_record:
-                raise Exception(f"Ордер не найден: {token}, {exchange}, {market_type}")
+                # Вычисляем пропорцию
+                ratio = float(qty) / float(order_data['qty_current'])
 
-            # Создаем словарь для данных из текущей записи
-            order_data = {
-                'token': order_record[0],
-                'exchange': order_record[1],
-                'market_type': order_record[2],
-                'order_type': order_record[3],
-                'order_side': order_record[4],
-                'open_price': order_record[5],
-                'open_usdt_amount': order_record[6],
-                'qty_current': order_record[7],
-                'realized_pnl': order_record[8],
-                'leverage': order_record[9],
-                'created_at': order_record[10]
-            }
+                # Пересчитываем значения
+                adjusted_open_usdt_amount = float(order_data['open_usdt_amount']) * ratio
+                adjusted_pnl = float(order_data['realized_pnl']) * ratio + close_fee
 
-            # Начинаем транзакцию
-            self.conn.autocommit = False
-            real_pnl = order_data['realized_pnl'] + close_fee
+                # Добавляем запись в историю торговли
+                cursor.execute("""
+                    INSERT INTO trading_history (
+                        token, order_type, order_side,
+                        open_price, close_price, open_usdt_amount, close_usdt_amount,
+                        qty, realized_pnl, leverage, created_at, closed_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    order_data['token'], order_data['order_type'], order_data['order_side'],
+                    order_data['open_price'], close_price, adjusted_open_usdt_amount,
+                    close_usdt_amount, qty, adjusted_pnl,
+                    order_data['leverage'], order_data['created_at'], closed_at
+                ))
 
-            try:
-                # Проверяем, закрывается ли ордер полностью или частично
-                if float(order_data['qty_current']) - float(qty) < 0.000001:
-                    # Полное закрытие ордера
+                # Обновляем количество в текущих ордерах
+                new_qty = float(order_data['qty_current']) - float(qty)
+                new_usdt_amount = float(order_data['open_usdt_amount']) - adjusted_open_usdt_amount
+                new_open_fee = float(order_data['open_fee']) - adjusted_pnl
+                cursor.execute("""
+                    UPDATE current_orders
+                    SET qty = %s, usdt_amount = %s, usdt_fee = %s
+                    WHERE token = %s
+                """, (new_qty, new_usdt_amount, new_open_fee, token))
 
-                    # Добавляем запись в историю торговли
-                    cursor.execute("""
-                        INSERT INTO trading_history (
-                            token, exchange, market_type, order_type, order_side,
-                            open_price, close_price, open_usdt_amount, close_usdt_amount,
-                            qty, realized_pnl, leverage, created_at, closed_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """, (
-                        order_data['token'], order_data['exchange'], order_data['market_type'],
-                        order_data['order_type'], order_data['order_side'],
-                        order_data['open_price'], close_price, order_data['open_usdt_amount'],
-                        close_usdt_amount, qty, real_pnl,
-                        order_data['leverage'], order_data['created_at'], closed_at
-                    ))
-
-                    # Удаляем запись из текущих ордеров
-                    cursor.execute("""
-                        DELETE FROM current_orders
-                        WHERE token = %s AND exchange = %s AND market_type = %s
-                    """, (token, exchange, market_type))
-
-                else:
-                    # Частичное закрытие ордера
-
-                    # Вычисляем пропорцию
-                    ratio = float(qty) / float(order_data['qty_current'])
-
-                    # Пересчитываем значения
-                    adjusted_open_usdt_amount = float(order_data['open_usdt_amount']) * ratio
-                    adjusted_pnl = float(order_data['open_fee']) * + close_fee
-
-                    # Добавляем запись в историю торговли
-                    cursor.execute("""
-                        INSERT INTO trading_history (
-                            token, exchange, market_type, order_type, order_side,
-                            open_price, close_price, open_usdt_amount, close_usdt_amount,
-                            qty, realized_pnl, leverage, created_at, closed_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """, (
-                        order_data['token'], order_data['exchange'], order_data['market_type'],
-                        order_data['order_type'], order_data['order_side'],
-                        order_data['open_price'], close_price, adjusted_open_usdt_amount,
-                        close_usdt_amount, qty, adjusted_pnl,
-                        order_data['leverage'], order_data['created_at'], closed_at
-                    ))
-
-                    # Обновляем количество в текущих ордерах
-                    new_qty = float(order_data['qty_current']) - float(qty)
-                    new_usdt_amount = float(order_data['open_usdt_amount']) - adjusted_open_usdt_amount
-                    new_open_fee = float(order_data['open_fee']) - adjusted_pnl
-                    cursor.execute("""
-                        UPDATE current_orders
-                        SET qty = %s, usdt_amount = %s, usdt_fee = %s
-                        WHERE token = %s AND exchange = %s AND market_type = %s
-                    """, (new_qty, new_usdt_amount, new_open_fee, token, exchange, market_type))
-
-                # Подтверждаем транзакцию
-                self.conn.commit()
-                return True
-
-            except Exception as e:
-                # Откатываем транзакцию в случае ошибки
-                self.conn.rollback()
-                raise Exception(f"Ошибка при закрытии ордера: {str(e)}")
-
-            finally:
-                # Возвращаем автокоммит в исходное состояние
-                self.conn.autocommit = True
-                cursor.close()
+            # Подтверждаем транзакцию
+            self.conn.commit()
+            return True
 
         except Exception as e:
+            # Откатываем транзакцию в случае ошибки
+            self.conn.rollback()
             raise Exception(f"Ошибка при закрытии ордера: {str(e)}")
 
-    def order_exists(self, table_name, token, exchange, market_type):
+        finally:
+            # Возвращаем автокоммит в исходное состояние
+            self.conn.autocommit = True
+            cursor.close()
+
+
+    def order_exists(self, table_name, token):
         """Проверяет, существует ли в таблице current_orders запись с заданным token"""
         query = f"""
         SELECT 1 FROM {table_name}
-        WHERE token = %s AND exchange = %s AND market_type = %s
+        WHERE token = %s
         """
         with self.conn.cursor() as cur:
-            cur.execute(query, (token, exchange, market_type))
+            cur.execute(query, (token, ))
             return cur.fetchone() is not None
 
     def get_order(self, token):
@@ -427,22 +287,20 @@ class DBManager:
                 raise ValueError(f"No order found with token '{token}'.")
             return dict(order)
 
-    def delete_order(self, token, exchange, market_type):
-        """Удаляет запись из таблицы current_orders по ключу (token, exchange, market_type)"""
+    def delete_order(self, token):
+        """Удаляет запись из таблицы current_orders по ключу (token, )"""
         query = """DELETE FROM current_orders
-        WHERE token = %s AND exchange = %s AND market_type = %s"""
+        WHERE token = %s"""
         with self.conn.cursor() as cur:
-            cur.execute(query, (token, exchange, market_type))
+            cur.execute(query, (token, ))
 
-    def add_orderbook(self, exchange: str, market_type: str, symbol: str,
+    def add_orderbook(self, symbol: str,
                      time: datetime, bid_price: float, bid_volume: float,
                      ask_price: float, ask_volume: float):
         """
-        Сохраняет состояние биржевого стакана в таблицу raw_orderbook_data
+        Сохраняет состояние биржевого стакана в таблицу tick_ob
 
         Args:
-            exchange: название биржи
-            market_type: тип рынка
             symbol: символ торговой пары
             time: время обновления
             bid_price: цена лучшего бида
@@ -452,25 +310,34 @@ class DBManager:
         """
 
         query = """
-            INSERT INTO raw_orderbook_data (
-                exchange, market_type, token, time,
+            INSERT INTO tick_ob (
+                token, time,
                 bid_price, bid_size, ask_price, ask_size
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (exchange, market_type, token, time)
-            DO NOTHING;
+            ) VALUES (%s, %s, %s, %s, %s, %s)
         """
         with self.conn.cursor() as cur:
             cur.execute(query, (
-                exchange, market_type, symbol, time,
-                bid_price, bid_volume, ask_price, ask_volume
+                symbol, time, bid_price, bid_volume, ask_price, ask_volume
             ))
+
+    def add_orderbook_bulk(self, df):
+        query = """
+            INSERT INTO tick_ob (
+                token, time, bid_price, bid_size, ask_price, ask_size
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (token, time)
+                DO NOTHING
+        """
+
+        data = df.rows()
+        with self.conn.cursor() as cur:
+            cur.executemany(query, data)
+
 
     def get_orderbooks(
         self,
-        exchange: str,
-        market_type: str,
         symbol: str | None = None,
-        interval: str = "1min",   # параметр агрегации
+        interval: str = "5m",   # параметр агрегации
         start_date: datetime | None = None,
         end_date: datetime | None = None,
     ) -> pl.DataFrame:
@@ -478,10 +345,8 @@ class DBManager:
         Получает историю изменения ордербука по конкретной монете
 
         Args:
-            exchange: название биржи
-            market_type: тип рынка
             symbol: символ торговой пары
-            interval: окно агрегации (например: "1min", "15min", "1h")
+            interval: окно агрегации (например: "5m", "1h")
             start_date: начало периода (UTC)
             end_date: конец периода (UTC)
 
@@ -489,7 +354,7 @@ class DBManager:
             polars.DataFrame с историей ордербука
         """
 
-        valid_intervals = {"1min", "1h", "4h"}
+        valid_intervals = {"5m", "1h", "4h"}
         if interval not in valid_intervals:
             raise ValueError(f"Недопустимый интервал: {interval}. Разрешено: {valid_intervals}")
 
@@ -497,28 +362,35 @@ class DBManager:
 
         # Базовый запрос
         query = f"""
-            SELECT bucket, token, exchange, market_type, bid_price, bid_size, ask_price, ask_size
+            SELECT time, token, price
             FROM {table}
-            WHERE exchange = %s
-            AND market_type = %s
         """
 
-        params = [exchange, market_type]
+        params = []
+
+        if symbol or start_date or end_date:
+            query += " WHERE"
 
         if symbol is not None:
-            query += " AND token = %s"
+            query += " token = %s"
             params.append(symbol)
 
         # Фильтры по времени
         if start_date is not None:
-            query += " AND bucket >= %s"
+            if symbol:
+                query += " AND time >= %s"
+            else:
+                query += " time >= %s"
             params.append(start_date)
 
         if end_date is not None:
-            query += " AND bucket <= %s"
+            if symbol or start_date:
+                query += " AND time <= %s"
+            else:
+                query += " time <= %s"
             params.append(end_date)
 
-        query += " ORDER BY bucket;"
+        query += " ORDER BY time;"
 
         with self.conn.cursor() as cur:
             cur.execute(query, tuple(params))
@@ -527,27 +399,48 @@ class DBManager:
 
         return pl.DataFrame(data, schema=columns, orient="row")
 
-    def get_raw_orderbooks(self, exchange, market_type, token=None, start_time=None, end_time=None):
+    def get_oldest_date_in_orderbook(self, token):
         query = """
-            SELECT exchange, market_type, token, time,
-                   bid_price, bid_size, ask_price, ask_size
-            FROM raw_orderbook_data
-            WHERE exchange = %s
-              AND market_type = %s
+            SELECT MIN("time") AS oldest_time
+            FROM tick_ob
+            WHERE token = %s;
         """
 
-        params = [exchange, market_type]
+        with self.conn.cursor() as cur:
+            # return pl.read_database(query, cur)
+            cur.execute(query, [token])
+            res = cur.fetchone()
+
+        return res[0]
+
+    def get_tick_ob(self, token=None, start_time=None, end_time=None):
+        query = """
+            SELECT token, time,
+                   bid_price, bid_size, ask_price, ask_size
+            FROM tick_ob
+        """
+
+        if token or start_time or end_time:
+            query += " WHERE"
+
+        params = []
 
         if token is not None:
-            query += " AND token = %s"
+            query += " token = %s"
             params.append(token)
 
         if start_time is not None:
-            query += " AND time >= %s"
+            if token:
+                query += " AND time >= %s"
+            else:
+                query += " time >= %s"
             params.append(start_time)
 
         if end_time is not None:
-            query += " AND time <= %s"
+            if token or start_time:
+                query += " AND time <= %s"
+            else:
+                query += " time <= %s"
             params.append(end_time)
 
         query += " ORDER BY time;"
@@ -560,95 +453,6 @@ class DBManager:
 
         return pl.DataFrame(rows, schema=colnames, orient="row")
 
-
-    def update_data(self, data, tokens_to_insert):
-        with self.conn.cursor() as cur:
-            query = """
-            INSERT INTO current_data (
-                exchange, market_type, token, timestamp, bid_price, ask_price
-            ) VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (exchange, market_type, token)
-            DO UPDATE SET
-                timestamp = EXCLUDED.timestamp,
-                bid_price = EXCLUDED.bid_price,
-                ask_price = EXCLUDED.ask_price;
-            """
-            for exchange, markets in data.items():
-                exc = exchange.split('_')[0]
-                market_type = "spot" if "spot" in exchange else "linear"
-                for symbol, metrics in markets.items():
-                    if symbol in tokens_to_insert:
-                        cur.execute(query, (
-                            exc,
-                            market_type,
-                            symbol,
-                            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                            metrics.get('bid_price'),
-                            metrics.get('ask_price'),
-                        ))
-
-    def update_stats(self, df):
-        """Обновляет статистику в таблице stats_data по ключу (token, long_exc, short_exc)"""
-        query = """
-            INSERT INTO stats_data (token, long_exc, short_exc, mean, std, cmean, cstd)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (token, long_exc, short_exc)
-            DO UPDATE SET
-                mean = EXCLUDED.mean,
-                std = EXCLUDED.std,
-                cmean = EXCLUDED.cmean,
-                cstd = EXCLUDED.cstd
-        """
-
-        if isinstance(df, pl.DataFrame):
-            df = df.to_pandas()
-
-        with self.conn.cursor() as cursor:
-            # Преобразуем DataFrame в список кортежей
-            data = [
-                (row.token, row.long_exc, row.short_exc, row.mean, row.std, row.cmean, row.cstd)
-                for row in df.itertuples()
-            ]
-            try:
-                cursor.executemany(query, data)
-            except Exception as e:
-                print(f"Error updating stats: {e}")
-                self.conn.rollback()
-                raise
-
-    def copy_data_from_redis(self, df):
-        """Записывает данные в таблицу market_data по ключу
-        (exchange, market_type, token, timestamp)"""
-        query = """
-            INSERT INTO market_data (exchange, market_type, token, timestamp, ask_price, bid_price)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (exchange, market_type, token, timestamp)
-            DO UPDATE SET
-                exchange = EXCLUDED.exchange,
-                market_type = EXCLUDED.market_type,
-                token = EXCLUDED.token,
-                timestamp = EXCLUDED.timestamp
-        """
-
-        if isinstance(df, pl.DataFrame):
-            df = df.to_pandas()
-
-        Moscow_TZ = timezone(timedelta(hours=3))
-        created_at = datetime.now(Moscow_TZ).strftime('%Y-%m-%d %H:%M:%S')
-
-        with self.conn.cursor() as cursor:
-            # Преобразуем DataFrame в список кортежей
-            data = [
-                (row.exchange, 'linear', row.token, created_at, row.ask, row.bid)
-                for row in df.itertuples()
-            ]
-            try:
-                cursor.executemany(query, data)
-            except Exception as e:
-                print(f"Error updating stats: {e}")
-                self.conn.rollback()
-                raise
-
     def clear_old_data(self, table, column, expiration_time, units):
         """
         Удаляет из таблицы 'table' все данные, которые старше 'expiration_time',
@@ -659,7 +463,7 @@ class DBManager:
         :param units: единицы измерения времени: ('hour', 'hours', 'seconds', 'minutes')
         """
         assert units in ('hour', 'hours', 'seconds', 'minutes'), "units should be in ('hour', 'hours', 'seconds', 'minutes')"
-        assert column in ('bucket', 'timestamp', 'time'), "column should be in ('bucket', 'time', 'timestamp')"
+        assert column in ('time', 'timestamp', 'time'), "column should be in ('time', 'time', 'timestamp')"
 
         query = f"DELETE FROM {table} WHERE {column} < NOW() - INTERVAL '{expiration_time} {units}';"
         with self.conn.cursor() as cur:
@@ -687,66 +491,6 @@ class DBManager:
         except Exception as e:
             self.conn.rollback()
             raise ValueError(f"Failed to fetch data from table '{table_name}': {e}")
-
-    def get_unique_tokens(self):
-        """
-        Возвращает список уникальных значений токенов из таблицы market_data_5s
-        """
-        with self.conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT token FROM market_data_5s")
-            tokens = [row[0] for row in cur.fetchall()]
-            return tokens
-
-    def get_token_history(self, token):
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute("SELECT * FROM market_data_5s WHERE token = %s", (token,))
-                # Получение данных и названий столбцов
-                rows = cur.fetchall()
-                columns = [desc[0] for desc in cur.description]
-                # Преобразование в DataFrame
-                df = pd.DataFrame(rows, columns=columns)
-                return df.reset_index(drop=True)
-        except Exception as e:
-            self.conn.rollback()
-            raise ValueError(f"Failed to fetch data from table: {e}")
-
-    def get_auto_copy_trigger_state(self):
-        """
-        Функция проверяет, в какое значение установлено автокопирование данных
-        из таблицы current_data в таблицу market_data ('ENABLE' or 'DISABLE')
-        """
-        query = """
-            SELECT tgenabled
-            FROM pg_trigger
-            JOIN pg_class ON pg_trigger.tgrelid = pg_class.oid
-            WHERE pg_class.relname = 'current_data'
-                AND pg_trigger.tgname = 'after_current_data_change';
-        """
-        with self.conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(query)
-            result = cur.fetchone()
-
-        if result:
-            state = result['tgenabled']
-            if state == 'O':
-                return "ENABLED"
-            elif state == 'D':
-                return "DISABLED"
-        return "UNKNOWN"
-
-    def set_auto_copy_trigger_state(self, state=''):
-        """
-        Включает или отключает автокопирование данных из таблицы current_data
-        в долговременную память в таблицу market_data.
-
-        :param state: 'ENABLE' or 'DISABLE'
-        """
-        assert state.upper() in ('ENABLE', 'DISABLE'), 'state should be ENABLE or DISABLE'
-        action = "ENABLE" if state.upper() == 'ENABLE' else "DISABLE"
-        with self.conn.cursor(row_factory=dict_row) as cur:
-            query = f"ALTER TABLE current_data {action} TRIGGER after_current_data_change;"
-            cur.execute(query)
 
     def get_columns(self, table_name):
         """Получить список столбцов таблицы"""
